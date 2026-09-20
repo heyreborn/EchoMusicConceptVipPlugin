@@ -1,7 +1,6 @@
 import type { EchoPluginContext, KugouApiResult, KugouAuth, KugouClient } from './types';
 
 const GATEWAY = 'https://gateway.kugou.com';
-const VIP_GATEWAY = 'https://kugouvip.kugou.com';
 const LITE_SALT = 'LnT6xpN3khm36zse0QzvmgTZ3waWdRSA';
 const LITE_APP_ID = 3116;
 const LITE_CLIENT_VERSION = 11440;
@@ -209,13 +208,6 @@ export const createKugouClient = (ctx: EchoPluginContext): KugouClient => {
         method: 'POST',
         params: { source_id: 90139, receive_day: day },
         contentType: 'application/x-www-form-urlencoded',
-      }),
-    getMonthVipRecord: () =>
-      request('/youth/v1/activity/get_month_vip_record', { params: { latest_limit: 100 } }),
-    getUnionVip: () =>
-      request('/v1/get_union_vip', {
-        baseUrl: VIP_GATEWAY,
-        params: { busi_type: 'concept', opt_product_types: 'dvip,qvip', product_type: 'svip' },
       }),
     upgradeDayVip: () =>
       request('/youth/v1/listen_song/upgrade_vip_reward', {

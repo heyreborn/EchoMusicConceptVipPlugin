@@ -2,13 +2,13 @@ import { describe, expect, test } from '@rstest/core';
 import {
   DEFAULT_SETTINGS,
   EMPTY_PERSISTED_STATE,
-  EMPTY_STATUS,
   addDays,
   buildTargetDates,
   createVipService,
   formatChinaDay,
-  formatVipText,
-  hasClaimedDay,
+  isAdLimitResult,
+  nextChinaDailyRunAt,
+  normalizePersistedState,
   normalizeSettings,
 } from '../src/core';
 import {
@@ -18,12 +18,7 @@ import {
   parseKugouResult,
   signAndroidLite,
 } from '../src/kugou';
-import type {
-  EchoPluginContext,
-  KugouApiResult,
-  KugouClient,
-  PluginState,
-} from '../src/types';
+import type { EchoPluginContext, KugouApiResult, KugouClient, PluginState } from '../src/types';
 
 const success = (message = '成功', data: unknown = null): KugouApiResult => ({
   ok: true,
@@ -50,18 +45,11 @@ const createState = (): PluginState => ({
     claimedDates: {},
     upgradeDates: {},
     adTaskDates: {},
-    history: [],
+    futureLimits: {},
+    autoRunDates: {},
   },
-  status: { ...EMPTY_STATUS },
-  monthRecord: null,
-  vipDetail: null,
-  vipText: '',
   running: false,
-  refreshing: false,
-  refreshMessage: '尚未刷新状态',
-  refreshedAt: 0,
   cancelRequested: false,
-  progress: { phase: 'idle', current: 0, total: 0, label: '' },
 });
 
 const createContext = () => {
@@ -98,20 +86,12 @@ const createContext = () => {
 };
 
 const createClient = (overrides: Partial<KugouClient> = {}) => {
-  const calls = { claim: [] as string[], record: 0, vip: 0, upgrade: 0, ad: 0 };
+  const calls = { claim: [] as string[], upgrade: 0, ad: 0 };
   const client: KugouClient = {
     getAuth: () => ({ token: 'token', userId: 1, mid: 'mid', dfid: 'dfid', uuid: 'uuid' }),
     async claimDayVip(day) {
       calls.claim.push(day);
       return success('领取成功');
-    },
-    async getMonthVipRecord() {
-      calls.record += 1;
-      return success('成功', []);
-    },
-    async getUnionVip() {
-      calls.vip += 1;
-      return success('成功', { busi_vip: [] });
     },
     async upgradeDayVip() {
       calls.upgrade += 1;
@@ -173,153 +153,57 @@ describe('direct KuGou client', () => {
   });
 });
 
-describe('date and response utilities', () => {
-  test('uses China time and crosses month boundaries', () => {
-    expect(formatChinaDay(new Date('2026-09-19T16:30:00.000Z'))).toBe('2026-09-20');
-    expect(addDays('2026-09-30', 1)).toBe('2026-10-01');
-  });
-
-  test('builds today plus seven future days by default', () => {
-    const dates = buildTargetDates(DEFAULT_SETTINGS, new Date('2026-09-20T02:00:00.000Z'));
-    expect(dates).toHaveLength(8);
-    expect(dates[0]).toBe('2026-09-20');
-    expect(dates[7]).toBe('2026-09-27');
-  });
-
-  test('normalizes safe defaults', () => {
+describe('settings and schedule utilities', () => {
+  test('uses the safe automation defaults', () => {
+    expect(normalizeSettings({})).toEqual(DEFAULT_SETTINGS);
+    expect(DEFAULT_SETTINGS.delaySeconds).toBe(60);
     expect(normalizeSettings({ futureDays: 99, delaySeconds: -1, adCount: 20 })).toMatchObject({
-      autoClaim: false,
       futureDays: 7,
       delaySeconds: 0,
-      adEnabled: false,
       adCount: 8,
     });
-    expect(normalizeSettings({}).delaySeconds).toBe(60);
   });
 
-  test('finds claimed days and formats membership status', () => {
-    expect(hasClaimedDay({ data: { records: [{ receive_day: '2026-09-20' }] } }, '2026-09-20')).toBe(true);
-    expect(
-      formatVipText({ data: { busi_vip: [{ product_type: 'svip', is_vip: 1, vip_end_time: 1790000000 }] } }),
-    ).toContain('概念会员：生效中');
+  test('builds China-time future dates across month boundaries', () => {
+    expect(formatChinaDay(new Date('2026-09-19T16:30:00.000Z'))).toBe('2026-09-20');
+    expect(addDays('2026-09-30', 1)).toBe('2026-10-01');
+    const dates = buildTargetDates(DEFAULT_SETTINGS, new Date('2026-09-20T02:00:00.000Z'));
+    expect(dates).toHaveLength(8);
+    expect(dates.at(-1)).toBe('2026-09-27');
+  });
+
+  test('schedules the daily task for 09:00 China time', () => {
+    expect(nextChinaDailyRunAt(new Date('2026-09-20T00:00:00Z')).toISOString()).toBe('2026-09-20T01:00:00.000Z');
+    expect(nextChinaDailyRunAt(new Date('2026-09-20T02:00:00Z')).toISOString()).toBe('2026-09-21T01:00:00.000Z');
+  });
+
+  test('normalizes the internal automation state', () => {
+    expect(normalizePersistedState({ retryCount: 99, history: [{ id: 'old' }] })).toMatchObject({
+      futureLimits: {},
+      autoRunDates: {},
+      retryCount: 3,
+    });
+  });
+
+  test('recognizes the exhausted advertising response', () => {
+    expect(isAdLimitResult(failure(1, '今天次数已用光'))).toBe(true);
   });
 });
 
-describe('task service', () => {
-  test('claims the configured date range sequentially', async () => {
+describe('automatic task service', () => {
+  test('runs today, upgrade, ads and future claims in order', async () => {
     const { ctx } = createContext();
-    const { client, calls } = createClient();
     const state = createState();
     state.settings.futureDays = 2;
-    const service = createVipService(ctx, state, client, {
-      now: () => new Date('2026-09-20T02:00:00Z'),
-      sleep: async () => {},
-    });
-    const result = await service.claimConfigured();
-    expect(result.ok).toBe(true);
-    expect(calls.claim).toEqual(['2026-09-20', '2026-09-21', '2026-09-22']);
-    expect(Object.keys(state.persisted.claimedDates)).toHaveLength(3);
-  });
-
-  test('treats code 131001 as already claimed only in claim flow', async () => {
-    const { ctx } = createContext();
-    const { client } = createClient({ claimDayVip: async () => failure(131001, '酷狗接口错误') });
-    const state = createState();
-    const result = await createVipService(ctx, state, client).claimToday();
-    expect(result).toMatchObject({ ok: true, alreadyClaimed: true });
-    expect(state.persisted.claimedDates[formatChinaDay()]?.already).toBe(true);
-  });
-
-  test('stops future claims after auth expiration', async () => {
-    const { ctx } = createContext();
-    const { client, calls } = createClient({ claimDayVip: async (day) => {
-      calls.claim.push(day);
-      return failure(20018, '登录已过期');
-    } });
-    const state = createState();
-    state.settings.futureDays = 7;
-    const result = await createVipService(ctx, state, client).claimConfigured();
-    expect(result.ok).toBe(false);
-    expect(calls.claim).toHaveLength(1);
-  });
-
-  test('stops after the first future duration limit', async () => {
-    const { ctx } = createContext();
-    const { client, calls } = createClient({ claimDayVip: async (day) => {
-      calls.claim.push(day);
-      return day === '2026-09-20' ? success() : failure(131002, '未来时长不足');
-    } });
-    const state = createState();
-    state.settings.futureDays = 7;
-    const result = await createVipService(ctx, state, client, {
-      now: () => new Date('2026-09-20T02:00:00Z'),
-      sleep: async () => {},
-    }).claimConfigured();
-    expect(result).toMatchObject({ ok: true, limited: true });
-    expect(result.message).toContain('已达当前可预领上限，停在 2026-09-21');
-    expect(state.status.kind).toBe('limit');
-    expect(calls.claim).toEqual(['2026-09-20', '2026-09-21']);
-  });
-
-  test('runs ads with an interval after the first report', async () => {
-    const { ctx } = createContext();
-    const { client, calls } = createClient();
-    const waits: number[] = [];
-    const state = createState();
+    state.settings.autoUpgrade = true;
     state.settings.adEnabled = true;
-    state.settings.adCount = 3;
-    const result = await createVipService(ctx, state, client, {
-      sleep: async (milliseconds) => { waits.push(milliseconds); },
-    }).runAds();
-    expect(result.ok).toBe(true);
-    expect(calls.ad).toBe(3);
-    expect(waits).toEqual([35_000, 35_000]);
-  });
-
-  test('cancels remaining ad reports during the interval', async () => {
-    const { ctx } = createContext();
-    const { client, calls } = createClient();
-    const state = createState();
-    state.settings.adEnabled = true;
-    state.settings.adCount = 3;
-    let service: ReturnType<typeof createVipService>;
-    service = createVipService(ctx, state, client, {
-      sleep: async () => {
-        service.cancel();
-      },
-    });
-    const result = await service.runAds();
-    expect(result.canceled).toBe(true);
-    expect(calls.ad).toBe(1);
-  });
-
-  test('converts missing auth into a visible failed result', async () => {
-    const { ctx } = createContext();
-    const { client } = createClient({
-      getAuth: () => {
-        throw new Error('请先在 EchoMusic 登录酷狗账号');
-      },
-    });
-    const state = createState();
-    const result = await createVipService(ctx, state, client).claimToday();
-    expect(result).toMatchObject({ ok: false, message: '请先在 EchoMusic 登录酷狗账号' });
-    expect(state.status.kind).toBe('error');
-    expect(state.persisted.history).toHaveLength(1);
-  });
-
-  test('extends membership before claiming future dates', async () => {
-    const { ctx } = createContext();
+    state.settings.adCount = 1;
     const order: string[] = [];
     const { client } = createClient({
       claimDayVip: async (day) => { order.push(`claim:${day}`); return success(); },
-      reportAdPlay: async () => { order.push('ad'); return success('成功', { done: 1, remain: 0 }); },
       upgradeDayVip: async () => { order.push('upgrade'); return success(); },
+      reportAdPlay: async () => { order.push('ad'); return success('成功', { done: 1, remain: 0 }); },
     });
-    const state = createState();
-    state.settings.futureDays = 2;
-    state.settings.adEnabled = true;
-    state.settings.adCount = 1;
-    state.settings.autoUpgrade = true;
     const result = await createVipService(ctx, state, client, {
       now: () => new Date('2026-09-20T02:00:00Z'),
       sleep: async () => {},
@@ -332,7 +216,82 @@ describe('task service', () => {
       'claim:2026-09-21',
       'claim:2026-09-22',
     ]);
-    expect(state.persisted.history).toHaveLength(1);
+  });
+
+  test('treats already-completed operations as successful no-ops', async () => {
+    const { ctx } = createContext();
+    const state = createState();
+    state.settings.autoUpgrade = true;
+    const { client } = createClient({
+      claimDayVip: async () => failure(131001, '已经领取'),
+      upgradeDayVip: async () => failure(297002, '已经领取过升级'),
+    });
+    const result = await createVipService(ctx, state, client).runAll();
+    expect(result).toMatchObject({ ok: true, changed: false });
+  });
+
+  test('caches the daily future limit and avoids repeated requests', async () => {
+    const { ctx } = createContext();
+    const state = createState();
+    state.settings.futureDays = 7;
+    const { client, calls } = createClient({
+      claimDayVip: async (day) => {
+        calls.claim.push(day);
+        return day === '2026-09-20' ? success() : failure(131002, '未来时长不足');
+      },
+    });
+    const service = createVipService(ctx, state, client, {
+      now: () => new Date('2026-09-20T02:00:00Z'),
+      sleep: async () => {},
+    });
+    const first = await service.runAll();
+    const second = await service.runAll();
+    expect(first).toMatchObject({ ok: true, limited: true });
+    expect(second).toMatchObject({ ok: true, limited: true, changed: false });
+    expect(calls.claim).toEqual(['2026-09-20', '2026-09-21']);
+    expect(state.persisted.futureLimits['2026-09-20']?.blockedDay).toBe('2026-09-21');
+  });
+
+  test('treats exhausted advertising attempts as completed', async () => {
+    const { ctx } = createContext();
+    const state = createState();
+    state.settings.adEnabled = true;
+    state.settings.adCount = 8;
+    state.persisted.claimedDates['2026-09-20'] = { ok: true, message: '已领取', updatedAt: 1 };
+    const { client, calls } = createClient({ reportAdPlay: async () => {
+      calls.ad += 1;
+      return failure(1, '今天次数已用光');
+    } });
+    const result = await createVipService(ctx, state, client, {
+      now: () => new Date('2026-09-20T02:00:00Z'),
+    }).runAll();
+    expect(result.ok).toBe(true);
+    expect(calls.ad).toBe(1);
+    expect(state.persisted.adTaskDates['2026-09-20']?.done).toBe(8);
+  });
+
+  test('runs ads with a 35 second interval', async () => {
+    const { ctx } = createContext();
+    const state = createState();
+    state.settings.adEnabled = true;
+    state.settings.adCount = 3;
+    const waits: number[] = [];
+    const { client, calls } = createClient();
+    const result = await createVipService(ctx, state, client, {
+      now: () => new Date('2026-09-20T02:00:00Z'),
+      sleep: async (milliseconds) => { waits.push(milliseconds); },
+    }).runAll();
+    expect(result.ok).toBe(true);
+    expect(calls.ad).toBe(3);
+    expect(waits).toEqual([35_000, 35_000]);
+  });
+
+  test('marks missing authentication as retryable', async () => {
+    const { ctx } = createContext();
+    const state = createState();
+    const { client } = createClient({ getAuth: () => { throw new Error('请先登录酷狗账号'); } });
+    const result = await createVipService(ctx, state, client).runAll();
+    expect(result).toMatchObject({ ok: false, retryable: true });
   });
 
   test('uses a settings snapshot for an active task', async () => {
@@ -343,7 +302,7 @@ describe('task service', () => {
     const { client, calls } = createClient({
       upgradeDayVip: async () => {
         state.settings.futureDays = 0;
-        return success('升级成功');
+        return success();
       },
     });
     const result = await createVipService(ctx, state, client, {
@@ -354,68 +313,11 @@ describe('task service', () => {
     expect(calls.claim).toEqual(['2026-09-20', '2026-09-21', '2026-09-22']);
   });
 
-  test('does not let membership query failure override a successful record refresh', async () => {
-    const today = formatChinaDay();
-    const { ctx } = createContext();
-    const { client } = createClient({
-      getMonthVipRecord: async () => success('成功', [{ receive_day: today }]),
-      getUnionVip: async () => failure(131001, '接口错误'),
-    });
-    const state = createState();
-    const result = await createVipService(ctx, state, client).refresh();
-    expect(result).toBe(true);
-    expect(state.persisted.claimedDates[today]?.ok).toBe(true);
-    expect(state.refreshing).toBe(false);
-    expect(state.refreshMessage).toContain('领取状态已更新');
-    expect(state.refreshedAt).toBeGreaterThan(0);
-    expect(state.vipText).toContain('查询失败');
-  });
-
-  test('deduplicates concurrent refresh requests', async () => {
+  test('deduplicates concurrent task runs', async () => {
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const { ctx } = createContext();
-    const { client, calls } = createClient({
-      getMonthVipRecord: async () => {
-        calls.record += 1;
-        await gate;
-        return success('成功', []);
-      },
-    });
     const state = createState();
-    const service = createVipService(ctx, state, client);
-    const first = service.refresh();
-    const second = service.refresh();
-    expect(state.refreshing).toBe(true);
-    release?.();
-    expect(await first).toBe(true);
-    expect(await second).toBe(true);
-    expect(calls.record).toBe(1);
-    expect(state.refreshing).toBe(false);
-  });
-
-  test('validates one-off specified dates', async () => {
-    const { ctx } = createContext();
-    const { client, calls } = createClient();
-    const state = createState();
-    const service = createVipService(ctx, state, client, {
-      now: () => new Date('2026-09-20T02:00:00Z'),
-    });
-    const invalid = await service.claimDate('2026-09-19');
-    expect(invalid.ok).toBe(false);
-    expect(invalid.message).toContain('不能领取早于今天');
-    const impossible = await service.claimDate('2026-02-31');
-    expect(impossible.ok).toBe(false);
-    expect(impossible.message).toContain('请选择有效的领取日期');
-    const valid = await service.claimDate('2026-09-23');
-    expect(valid.ok).toBe(true);
-    expect(calls.claim).toEqual(['2026-09-23']);
-  });
-
-  test('deduplicates concurrent operations', async () => {
-    let release: (() => void) | undefined;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    const { ctx } = createContext();
     const { client, calls } = createClient({
       claimDayVip: async (day) => {
         calls.claim.push(day);
@@ -423,12 +325,11 @@ describe('task service', () => {
         return success();
       },
     });
-    const service = createVipService(ctx, createState(), client);
-    const first = service.claimToday();
-    const second = service.claimToday();
+    const service = createVipService(ctx, state, client);
+    const first = service.runAll();
+    const second = service.runAll();
     release?.();
-    const [firstResult, secondResult] = await Promise.all([first, second]);
+    expect(await first).toEqual(await second);
     expect(calls.claim).toHaveLength(1);
-    expect(firstResult).toEqual(secondResult);
   });
 });
