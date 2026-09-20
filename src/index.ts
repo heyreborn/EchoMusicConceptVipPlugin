@@ -20,6 +20,7 @@ const statusLabel = (state: PluginState): string => {
     idle: '尚未执行',
     checking: '检查中',
     claiming: '领取中',
+    upgrading: '升级中',
     claimed: '已领取',
     'already-claimed': '今日已领取',
     upgraded: '已升级',
@@ -62,7 +63,8 @@ const createSettingsComponent = (
         () =>
           action.value !== '' ||
           state.status.kind === 'checking' ||
-          state.status.kind === 'claiming',
+          state.status.kind === 'claiming' ||
+          state.status.kind === 'upgrading',
       );
 
       onMounted(() => {
@@ -220,7 +222,10 @@ export async function activate(ctx: EchoPluginContext) {
     icon: 'tabler:gift',
     defaultPlacement: 'more',
     order: 300,
-    disabled: () => state.status.kind === 'checking' || state.status.kind === 'claiming',
+    disabled: () =>
+      state.status.kind === 'checking' ||
+      state.status.kind === 'claiming' ||
+      state.status.kind === 'upgrading',
     onClick: () => service.claimToday({ source: 'manual' }),
   });
 

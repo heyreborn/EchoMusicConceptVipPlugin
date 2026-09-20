@@ -8,6 +8,7 @@ export type ClaimStatusKind =
   | 'idle'
   | 'checking'
   | 'claiming'
+  | 'upgrading'
   | 'claimed'
   | 'already-claimed'
   | 'upgraded'

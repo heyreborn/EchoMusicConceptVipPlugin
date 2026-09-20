@@ -1,10 +1,12 @@
 import { describe, expect, test } from '@rstest/core';
 import {
+  AUTO_UPGRADE_RETRY_MS,
   DEFAULT_SETTINGS,
   EMPTY_STATUS,
   createVipService,
   formatChinaDay,
   getErrorMessage,
+  hasActiveSvip,
   hasClaimedDay,
   isAlreadyClaimedError,
   normalizeSettings,
@@ -81,6 +83,18 @@ describe('core utilities', () => {
     );
   });
 
+  test('detects an active svip from the VIP detail response', () => {
+    expect(
+      hasActiveSvip({
+        status: 1,
+        data: { busi_vip: [{ product_type: 'svip', is_vip: 1 }] },
+      }),
+    ).toBe(true);
+    expect(
+      hasActiveSvip({ data: { busi_vip: [{ product_type: 'svip', is_vip: 0 }] } }),
+    ).toBe(false);
+  });
+
   test('extracts KuGou API error messages', () => {
     const error = { response: { body: { status: 0, msg: '今日已领取' } } };
     expect(getErrorMessage(error)).toBe('今日已领取');
@@ -111,6 +125,73 @@ describe('VIP service', () => {
     expect(result).toMatchObject({ ok: true, claimed: true, upgraded: true });
     expect(calls.claim).toBe(1);
     expect(calls.upgrade).toBe(1);
+  });
+
+  test('upgrades an already claimed day when auto upgrade is enabled', async () => {
+    const today = formatChinaDay();
+    const { ctx, calls } = createContext({
+      async getVipMonthRecord() {
+        calls.record += 1;
+        return { status: 1, data: [{ receive_day: today }] };
+      },
+    });
+    const state = createState();
+    state.settings.autoUpgrade = true;
+    const result = await createVipService(ctx, state).claimToday({ source: 'auto' });
+    expect(result).toMatchObject({ ok: true, claimed: true, upgraded: true });
+    expect(calls.claim).toBe(0);
+    expect(calls.upgrade).toBe(1);
+  });
+
+  test('does not call the upgrade endpoint for an active svip account', async () => {
+    const today = formatChinaDay();
+    const { ctx, calls } = createContext({
+      async getVipMonthRecord() {
+        calls.record += 1;
+        return { status: 1, data: [{ receive_day: today }] };
+      },
+      async getUserVipDetail() {
+        return {
+          status: 1,
+          data: { busi_vip: [{ product_type: 'svip', is_vip: 1 }] },
+        };
+      },
+    });
+    const state = createState();
+    state.settings.autoUpgrade = true;
+    const result = await createVipService(ctx, state).claimToday();
+    expect(result).toMatchObject({ ok: true, upgraded: true });
+    expect(calls.upgrade).toBe(0);
+  });
+
+  test('manual upgrade requires the current day to be claimed', async () => {
+    const { ctx, calls } = createContext();
+    const result = await createVipService(ctx, createState()).upgrade();
+    expect(result.ok).toBe(false);
+    expect(calls.upgrade).toBe(0);
+  });
+
+  test('delays repeated automatic upgrade attempts after a recent failure', async () => {
+    const today = formatChinaDay();
+    const { ctx, calls } = createContext({
+      async getVipMonthRecord() {
+        calls.record += 1;
+        return { status: 1, data: [{ receive_day: today }] };
+      },
+    });
+    const state = createState();
+    state.settings.autoUpgrade = true;
+    const failedAt = Date.now() - AUTO_UPGRADE_RETRY_MS + 1000;
+    state.status = {
+      kind: 'partial',
+      day: today,
+      message: '上次升级失败',
+      updatedAt: failedAt,
+    };
+    const result = await createVipService(ctx, state).claimToday({ source: 'auto' });
+    expect(result).toMatchObject({ ok: true, claimed: true, upgraded: false });
+    expect(calls.upgrade).toBe(0);
+    expect(state.status).toMatchObject({ kind: 'partial', updatedAt: failedAt });
   });
 
   test('auto mode fails closed when the record cannot be checked', async () => {

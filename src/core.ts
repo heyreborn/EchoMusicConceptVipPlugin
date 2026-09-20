@@ -10,6 +10,7 @@ import type {
 
 export const SETTINGS_KEY = 'settings';
 export const STATUS_KEY = 'last-status';
+export const AUTO_UPGRADE_RETRY_MS = 6 * 60 * 60 * 1000;
 
 export const DEFAULT_SETTINGS: Readonly<PluginSettings> = Object.freeze({
   autoClaim: false,
@@ -53,6 +54,7 @@ export const normalizeStatus = (value: unknown): ClaimStatus => {
     'idle',
     'checking',
     'claiming',
+    'upgrading',
     'claimed',
     'already-claimed',
     'upgraded',
@@ -112,6 +114,28 @@ export const hasClaimedDay = (payload: unknown, day: string): boolean => {
   return visit(payload, 0);
 };
 
+export const hasActiveSvip = (payload: unknown): boolean => {
+  const seen = new WeakSet<object>();
+
+  const visit = (value: unknown, depth: number): boolean => {
+    if (depth > 10 || value === null || typeof value !== 'object') return false;
+    if (seen.has(value)) return false;
+    seen.add(value);
+    if (Array.isArray(value)) return value.some((item) => visit(item, depth + 1));
+
+    const record = value as Record<string, unknown>;
+    if (
+      String(record.product_type ?? '').toLowerCase() === 'svip' &&
+      Number(record.is_vip) === 1
+    ) {
+      return true;
+    }
+    return Object.values(record).some((item) => visit(item, depth + 1));
+  };
+
+  return visit(payload, 0);
+};
+
 const findMessage = (value: unknown, depth = 0): string => {
   if (depth > 5) return '';
   if (typeof value === 'string') return value.trim();
@@ -146,6 +170,9 @@ export const isAlreadyClaimedError = (error: unknown): boolean =>
     getErrorMessage(error, ''),
   );
 
+export const isAlreadyUpgradedError = (error: unknown): boolean =>
+  /(已升级|无需升级|重复升级|already\s*upgrad)/i.test(getErrorMessage(error, ''));
+
 const getApiMessage = (payload: unknown, fallback: string): string =>
   findMessage(payload) || fallback;
 
@@ -175,7 +202,7 @@ export const createVipService = (
   ctx: EchoPluginContext,
   state: PluginState,
 ): VipService => {
-  let claimInFlight: Promise<ClaimResult> | null = null;
+  let operationInFlight: Promise<ClaimResult> | null = null;
 
   const updateStatus = (
     kind: ClaimStatus['kind'],
@@ -195,19 +222,125 @@ export const createVipService = (
     return vipResult.status === 'fulfilled' || recordResult.status === 'fulfilled';
   };
 
+  const runExclusive = (operation: () => Promise<ClaimResult>): Promise<ClaimResult> => {
+    if (operationInFlight) return operationInFlight;
+    operationInFlight = operation().finally(() => {
+      operationInFlight = null;
+    });
+    return operationInFlight;
+  };
+
+  const readVipDetail = async () => {
+    try {
+      const detail = await ctx.kugou.user.getUserVipDetail();
+      state.vipDetail = detail;
+      return { available: true, detail };
+    } catch {
+      return { available: false, detail: null };
+    }
+  };
+
+  const finishAlreadyUpgraded = async (day: string, source: 'manual' | 'auto') => {
+    const message = '当前账号已是畅听会员';
+    await updateStatus('upgraded', day, message);
+    if (source === 'manual') ctx.toast.info(message);
+    return createResult({
+      ok: true,
+      claimed: true,
+      alreadyClaimed: true,
+      upgraded: true,
+      message,
+    });
+  };
+
+  const shouldDelayAutoUpgradeRetry = (day: string, previousStatus: ClaimStatus | null) =>
+    previousStatus?.kind === 'partial' &&
+    previousStatus.day === day &&
+    Date.now() - previousStatus.updatedAt < AUTO_UPGRADE_RETRY_MS;
+
+  const performUpgrade = async (
+    day: string,
+    source: 'manual' | 'auto',
+    knownClaimed: boolean,
+    previousStatus: ClaimStatus | null = state.status,
+  ): Promise<ClaimResult> => {
+    if (source === 'auto' && shouldDelayAutoUpgradeRetry(day, previousStatus)) {
+      state.status = previousStatus as ClaimStatus;
+      const message = previousStatus?.message || '升级稍后自动重试';
+      return createResult({ ok: true, claimed: true, message });
+    }
+
+    if (!knownClaimed) {
+      try {
+        const record = await ctx.kugou.user.getVipMonthRecord();
+        state.monthRecord = record;
+        if (!hasClaimedDay(record, day)) {
+          const message = '请先领取今日 VIP，再升级畅听会员';
+          await updateStatus('idle', day, message);
+          if (source === 'manual') ctx.toast.warning(message);
+          return createResult({ ok: false, message });
+        }
+      } catch (error) {
+        if (source === 'auto') {
+          const message = `自动升级已跳过：${getErrorMessage(error, '无法确认领取记录')}`;
+          await updateStatus('error', day, message);
+          return createResult({ ok: false, message });
+        }
+      }
+    }
+
+    const vip = await readVipDetail();
+    if (vip.available && hasActiveSvip(vip.detail)) {
+      return finishAlreadyUpgraded(day, source);
+    }
+    if (
+      !vip.available &&
+      previousStatus?.kind === 'upgraded' &&
+      previousStatus.day === day
+    ) {
+      return finishAlreadyUpgraded(day, source);
+    }
+
+    await updateStatus('upgrading', day, '正在升级畅听会员');
+    try {
+      const response = await ctx.kugou.user.upgradeDayVip();
+      const message = getApiMessage(response, '已升级为畅听会员');
+      await updateStatus('upgraded', day, message);
+      if (source === 'manual' || state.settings.notifySuccess) ctx.toast.success(message);
+      void refresh();
+      return createResult({ ok: true, claimed: true, upgraded: true, message });
+    } catch (error) {
+      if (isAlreadyUpgradedError(error)) {
+        return finishAlreadyUpgraded(day, source);
+      }
+      const detailAfterFailure = await readVipDetail();
+      if (detailAfterFailure.available && hasActiveSvip(detailAfterFailure.detail)) {
+        return finishAlreadyUpgraded(day, source);
+      }
+      const message = `VIP 已领取，但升级失败：${getErrorMessage(error)}`;
+      await updateStatus('partial', day, message);
+      if (source === 'manual' || state.settings.notifySuccess) ctx.toast.warning(message);
+      return createResult({ ok: false, claimed: true, message });
+    }
+  };
+
   const runClaim = async (options: ClaimOptions): Promise<ClaimResult> => {
     const source = options.source ?? 'manual';
     const day = formatChinaDay();
+    const previousStatus = state.status;
     await updateStatus('checking', day, '正在检查领取记录');
 
     try {
       const record = await ctx.kugou.user.getVipMonthRecord();
       state.monthRecord = record;
       if (hasClaimedDay(record, day)) {
+        if (state.settings.autoUpgrade) {
+          return performUpgrade(day, source, true, previousStatus);
+        }
         const message = `${day} 已领取`;
         await updateStatus('already-claimed', day, message);
         if (source === 'manual') ctx.toast.info(message);
-        return createResult({ ok: true, alreadyClaimed: true, message });
+        return createResult({ ok: true, claimed: true, alreadyClaimed: true, message });
       }
     } catch (error) {
       if (source === 'auto') {
@@ -223,10 +356,13 @@ export const createVipService = (
       claimResponse = await ctx.kugou.user.claimDayVip(day);
     } catch (error) {
       if (isAlreadyClaimedError(error)) {
+        if (state.settings.autoUpgrade) {
+          return performUpgrade(day, source, true, previousStatus);
+        }
         const message = `${day} 已领取`;
         await updateStatus('already-claimed', day, message);
         if (source === 'manual') ctx.toast.info(message);
-        return createResult({ ok: true, alreadyClaimed: true, message });
+        return createResult({ ok: true, claimed: true, alreadyClaimed: true, message });
       }
       const message = getErrorMessage(error, 'VIP 领取失败');
       await updateStatus('error', day, message);
@@ -235,24 +371,7 @@ export const createVipService = (
     }
 
     if (state.settings.autoUpgrade) {
-      try {
-        const upgradeResponse = await ctx.kugou.user.upgradeDayVip();
-        const message = getApiMessage(upgradeResponse, 'VIP 已领取并升级为畅听会员');
-        await updateStatus('upgraded', day, message);
-        if (source === 'manual' || state.settings.notifySuccess) {
-          ctx.toast.success(message);
-        }
-        void refresh();
-        return createResult({ ok: true, claimed: true, upgraded: true, message });
-      } catch (error) {
-        const message = `VIP 已领取，但升级失败：${getErrorMessage(error)}`;
-        await updateStatus('partial', day, message);
-        if (source === 'manual' || state.settings.notifySuccess) {
-          ctx.toast.warning(message);
-        }
-        void refresh();
-        return createResult({ ok: true, claimed: true, message });
-      }
+      return performUpgrade(day, source, true, null);
     }
 
     const message = getApiMessage(claimResponse, '今日概念版 VIP 领取成功');
@@ -263,29 +382,11 @@ export const createVipService = (
   };
 
   const claimToday = (options: ClaimOptions = {}): Promise<ClaimResult> => {
-    if (claimInFlight) return claimInFlight;
-    claimInFlight = runClaim(options).finally(() => {
-      claimInFlight = null;
-    });
-    return claimInFlight;
+    return runExclusive(() => runClaim(options));
   };
 
-  const upgrade = async (): Promise<ClaimResult> => {
-    const day = formatChinaDay();
-    try {
-      const response = await ctx.kugou.user.upgradeDayVip();
-      const message = getApiMessage(response, '已升级为畅听会员');
-      await updateStatus('upgraded', day, message);
-      ctx.toast.success(message);
-      void refresh();
-      return createResult({ ok: true, claimed: true, upgraded: true, message });
-    } catch (error) {
-      const message = getErrorMessage(error, '升级失败');
-      await updateStatus('error', day, message);
-      ctx.toast.danger(message);
-      return createResult({ ok: false, message });
-    }
-  };
+  const upgrade = (): Promise<ClaimResult> =>
+    runExclusive(() => performUpgrade(formatChinaDay(), 'manual', false));
 
   return { claimToday, upgrade, refresh };
 };
