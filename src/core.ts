@@ -266,39 +266,31 @@ export const createVipService = (
 
   const refresh = async (options: RefreshOptions = {}): Promise<boolean> => {
     state.refreshing = true;
-    const [vipResult, recordResult] = await Promise.allSettled([
-      ctx.kugou.user
-        .getUserVipDetail()
-        .then((result) => assertApiSuccess(result, '会员信息刷新失败')),
-      ctx.kugou.user
-        .getVipMonthRecord()
-        .then((result) => assertApiSuccess(result, '领取记录刷新失败')),
-    ]);
-    state.refreshing = false;
-    if (vipResult.status === 'fulfilled') state.vipDetail = vipResult.value;
-    if (recordResult.status === 'fulfilled') state.monthRecord = recordResult.value;
     const day = formatChinaDay();
-    const failures = [
-      vipResult.status === 'rejected'
-        ? `会员信息：${getErrorMessage(vipResult.reason, '查询失败')}`
-        : '',
-      recordResult.status === 'rejected'
-        ? `领取记录：${getErrorMessage(recordResult.reason, '查询失败')}`
-        : '',
-    ].filter(Boolean);
-    if (failures.length > 0) {
+    try {
+      const record = assertApiSuccess(
+        await ctx.kugou.user.getVipMonthRecord(),
+        '领取记录刷新失败',
+      );
+      state.monthRecord = record;
+      if (hasClaimedDay(record, day)) {
+        await updateStatus('already-claimed', day, `${day} 已领取`);
+      } else if (options.reportFailure !== false) {
+        await updateStatus('idle', day, '今日尚未领取');
+      }
+      return true;
+    } catch (error) {
       if (options.reportFailure !== false) {
-        await updateStatus('error', day, `状态刷新失败：${failures.join('；')}`);
+        await updateStatus(
+          'error',
+          day,
+          `状态刷新失败：领取记录：${getErrorMessage(error, '查询失败')}`,
+        );
       }
       return false;
+    } finally {
+      state.refreshing = false;
     }
-    if (recordResult.status === 'fulfilled' && hasClaimedDay(recordResult.value, day)) {
-      await updateStatus('already-claimed', day, `${day} 已领取`);
-    } else if (vipResult.status === 'fulfilled' && recordResult.status === 'fulfilled') {
-      const currentIsToday = state.status.day === day && state.status.kind !== 'idle';
-      if (!currentIsToday) await updateStatus('idle', day, '会员状态和领取记录已刷新');
-    }
-    return vipResult.status === 'fulfilled' && recordResult.status === 'fulfilled';
   };
 
   const runExclusive = (operation: () => Promise<ClaimResult>): Promise<ClaimResult> => {

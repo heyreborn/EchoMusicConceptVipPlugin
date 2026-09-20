@@ -24,7 +24,7 @@ const createState = (): PluginState => ({
 
 const createContext = (overrides: Partial<EchoPluginContext['kugou']['user']> = {}) => {
   const storage = new Map<string, unknown>();
-  const calls = { claim: 0, upgrade: 0, record: 0 };
+  const calls = { claim: 0, upgrade: 0, record: 0, detail: 0 };
   const ctx = {
     id: 'kugou-concept-vip',
     manifest: { name: '酷狗概念版 VIP' },
@@ -43,6 +43,7 @@ const createContext = (overrides: Partial<EchoPluginContext['kugou']['user']> = 
           return { status: 1, data: [] };
         },
         async getUserVipDetail() {
+          calls.detail += 1;
           return { status: 1, data: {} };
         },
         ...overrides,
@@ -237,20 +238,20 @@ describe('VIP service', () => {
     expect(state.status.kind).toBe('error');
   });
 
-  test('requires both VIP detail and claim record for a successful refresh', async () => {
-    const { ctx } = createContext({
+  test('refresh only uses the authoritative claim record endpoint', async () => {
+    const { ctx, calls } = createContext({
       async getUserVipDetail() {
         return { status: 0, error_code: 20010, error_msg: '登录已过期' };
       },
     });
     const state = createState();
     const result = await createVipService(ctx, state).refresh();
-    expect(result).toBe(false);
+    expect(result).toBe(true);
     expect(state.vipDetail).toBeNull();
     expect(state.monthRecord).not.toBeNull();
     expect(state.refreshing).toBe(false);
-    expect(state.status).toMatchObject({ kind: 'error' });
-    expect(state.status.message).toContain('登录已过期');
+    expect(state.status).toMatchObject({ kind: 'idle' });
+    expect(calls.detail).toBe(0);
   });
 
   test('refresh exposes an error code when a query returns a message-less 502', async () => {
@@ -272,7 +273,7 @@ describe('VIP service', () => {
 
   test('background refresh failure does not overwrite a successful operation status', async () => {
     const { ctx } = createContext({
-      async getUserVipDetail() {
+      async getVipMonthRecord() {
         throw new Error('network unavailable');
       },
     });
@@ -299,6 +300,21 @@ describe('VIP service', () => {
     const result = await createVipService(ctx, state).refresh();
     expect(result).toBe(true);
     expect(state.status).toMatchObject({ kind: 'already-claimed', day: today });
+  });
+
+  test('successful refresh clears a stale error from the current day', async () => {
+    const today = formatChinaDay();
+    const { ctx } = createContext();
+    const state = createState();
+    state.status = {
+      kind: 'error',
+      day: today,
+      message: '酷狗接口错误 (error_code: 131001)',
+      updatedAt: Date.now(),
+    };
+    const result = await createVipService(ctx, state).refresh();
+    expect(result).toBe(true);
+    expect(state.status).toMatchObject({ kind: 'idle', day: today, message: '今日尚未领取' });
   });
 
   test('delays repeated automatic upgrade attempts after a recent failure', async () => {

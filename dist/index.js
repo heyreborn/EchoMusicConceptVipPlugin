@@ -175,28 +175,19 @@ const createVipService = (ctx, state)=>{
         });
     const refresh = async (options = {})=>{
         state.refreshing = true;
-        const [vipResult, recordResult] = await Promise.allSettled([
-            ctx.kugou.user.getUserVipDetail().then((result)=>assertApiSuccess(result, '会员信息刷新失败')),
-            ctx.kugou.user.getVipMonthRecord().then((result)=>assertApiSuccess(result, '领取记录刷新失败'))
-        ]);
-        state.refreshing = false;
-        if ('fulfilled' === vipResult.status) state.vipDetail = vipResult.value;
-        if ('fulfilled' === recordResult.status) state.monthRecord = recordResult.value;
         const day = formatChinaDay();
-        const failures = [
-            'rejected' === vipResult.status ? `会员信息：${getErrorMessage(vipResult.reason, '查询失败')}` : '',
-            'rejected' === recordResult.status ? `领取记录：${getErrorMessage(recordResult.reason, '查询失败')}` : ''
-        ].filter(Boolean);
-        if (failures.length > 0) {
-            if (false !== options.reportFailure) await updateStatus('error', day, `状态刷新失败：${failures.join('；')}`);
+        try {
+            const record = assertApiSuccess(await ctx.kugou.user.getVipMonthRecord(), '领取记录刷新失败');
+            state.monthRecord = record;
+            if (hasClaimedDay(record, day)) await updateStatus('already-claimed', day, `${day} 已领取`);
+            else if (false !== options.reportFailure) await updateStatus('idle', day, '今日尚未领取');
+            return true;
+        } catch (error) {
+            if (false !== options.reportFailure) await updateStatus('error', day, `状态刷新失败：领取记录：${getErrorMessage(error, '查询失败')}`);
             return false;
+        } finally{
+            state.refreshing = false;
         }
-        if ('fulfilled' === recordResult.status && hasClaimedDay(recordResult.value, day)) await updateStatus('already-claimed', day, `${day} 已领取`);
-        else if ('fulfilled' === vipResult.status && 'fulfilled' === recordResult.status) {
-            const currentIsToday = state.status.day === day && 'idle' !== state.status.kind;
-            if (!currentIsToday) await updateStatus('idle', day, '会员状态和领取记录已刷新');
-        }
-        return 'fulfilled' === vipResult.status && 'fulfilled' === recordResult.status;
     };
     const runExclusive = (operation)=>{
         if (operationInFlight) return operationInFlight;
