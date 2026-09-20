@@ -61,15 +61,37 @@ const matchesDay = (value, day)=>{
     const normalized = value.trim();
     return normalized === day || normalized === day.replaceAll('-', '') || normalized.startsWith(`${day}T`) || normalized.startsWith(`${day} `);
 };
+const CLAIM_DAY_KEYS = new Set([
+    'receive_day',
+    'received_day',
+    'receive_date',
+    'received_date',
+    'claim_day',
+    'claimed_day'
+]);
+const CLAIM_RECORD_KEYS = new Set([
+    'data',
+    'list',
+    'records',
+    'record_list',
+    'days',
+    'receive_days',
+    'received_days',
+    'vip_records'
+]);
 const hasClaimedDay = (payload, day)=>{
     const seen = new WeakSet();
-    const visit = (value, depth)=>{
-        if (matchesDay(value, day)) return true;
+    const visit = (value, depth, allowDateValue = false)=>{
+        if (allowDateValue && matchesDay(value, day)) return true;
         if (depth > 10 || null === value || 'object' != typeof value) return false;
         if (seen.has(value)) return false;
         seen.add(value);
-        if (Array.isArray(value)) return value.some((item)=>visit(item, depth + 1));
-        return Object.values(value).some((item)=>visit(item, depth + 1));
+        if (Array.isArray(value)) return value.some((item)=>visit(item, depth + 1, allowDateValue));
+        return Object.entries(value).some(([key, item])=>{
+            const normalizedKey = key.toLowerCase();
+            if (CLAIM_DAY_KEYS.has(normalizedKey)) return matchesDay(item, day);
+            return visit(item, depth + 1, CLAIM_RECORD_KEYS.has(normalizedKey));
+        });
     };
     return visit(payload, 0);
 };
@@ -114,6 +136,29 @@ const getErrorMessage = (error, fallback = '操作失败')=>{
     const response = asRecord(record?.response);
     return findMessage(response?.body) || findMessage(record) || (error instanceof Error ? error.message : '') || fallback;
 };
+const getApiErrorCode = (payload)=>{
+    for (const key of [
+        'error_code',
+        'err_code',
+        'errcode'
+    ]){
+        const value = payload[key];
+        if (null != value && '0' !== String(value)) return `${key}: ${String(value)}`;
+    }
+    return '';
+};
+const assertApiSuccess = (payload, fallback)=>{
+    const record = asRecord(payload);
+    if (!record) throw new Error(fallback);
+    const statusFailed = void 0 !== record.status && 1 !== Number(record.status);
+    const successFailed = false === record.success;
+    const errorCode = getApiErrorCode(record);
+    if (statusFailed || successFailed || errorCode) {
+        const detail = getApiMessage(payload, '');
+        throw new Error(detail || (errorCode ? `${fallback} (${errorCode})` : fallback));
+    }
+    return payload;
+};
 const isAlreadyClaimedError = (error)=>/(已领取|领取过|重复领取|不可重复|already\s*(claimed|received))/i.test(getErrorMessage(error, ''));
 const isAlreadyUpgradedError = (error)=>/(已升级|无需升级|重复升级|already\s*upgrad)/i.test(getErrorMessage(error, ''));
 const getApiMessage = (payload, fallback)=>findMessage(payload) || fallback;
@@ -142,13 +187,13 @@ const createVipService = (ctx, state)=>{
     const refresh = async ()=>{
         state.refreshing = true;
         const [vipResult, recordResult] = await Promise.allSettled([
-            ctx.kugou.user.getUserVipDetail(),
-            ctx.kugou.user.getVipMonthRecord()
+            ctx.kugou.user.getUserVipDetail().then((result)=>assertApiSuccess(result, '会员信息刷新失败')),
+            ctx.kugou.user.getVipMonthRecord().then((result)=>assertApiSuccess(result, '领取记录刷新失败'))
         ]);
         state.refreshing = false;
         if ('fulfilled' === vipResult.status) state.vipDetail = vipResult.value;
         if ('fulfilled' === recordResult.status) state.monthRecord = recordResult.value;
-        return 'fulfilled' === vipResult.status || 'fulfilled' === recordResult.status;
+        return 'fulfilled' === vipResult.status && 'fulfilled' === recordResult.status;
     };
     const runExclusive = (operation)=>{
         if (operationInFlight) return operationInFlight;
@@ -159,7 +204,7 @@ const createVipService = (ctx, state)=>{
     };
     const readVipDetail = async ()=>{
         try {
-            const detail = await ctx.kugou.user.getUserVipDetail();
+            const detail = assertApiSuccess(await ctx.kugou.user.getUserVipDetail(), '会员信息查询失败');
             state.vipDetail = detail;
             return {
                 available: true,
@@ -196,7 +241,7 @@ const createVipService = (ctx, state)=>{
             });
         }
         if (!knownClaimed) try {
-            const record = await ctx.kugou.user.getVipMonthRecord();
+            const record = assertApiSuccess(await ctx.kugou.user.getVipMonthRecord(), '领取记录查询失败');
             state.monthRecord = record;
             if (!hasClaimedDay(record, day)) {
                 const message = '请先领取今日 VIP，再升级畅听会员';
@@ -208,21 +253,21 @@ const createVipService = (ctx, state)=>{
                 });
             }
         } catch (error) {
-            if ('auto' === source) {
-                const message = `自动升级已跳过：${getErrorMessage(error, '无法确认领取记录')}`;
-                await updateStatus('error', day, message);
-                return createResult({
-                    ok: false,
-                    message
-                });
-            }
+            const prefix = 'auto' === source ? '自动升级已跳过' : '无法升级';
+            const message = `${prefix}：${getErrorMessage(error, '无法确认领取记录')}`;
+            await updateStatus('error', day, message);
+            if ('manual' === source) ctx.toast.warning(message);
+            return createResult({
+                ok: false,
+                message
+            });
         }
         const vip = await readVipDetail();
         if (vip.available && hasActiveSvip(vip.detail)) return finishAlreadyUpgraded(day, source);
         if (!vip.available && previousStatus?.kind === 'upgraded' && previousStatus.day === day) return finishAlreadyUpgraded(day, source);
         await updateStatus('upgrading', day, '正在升级畅听会员');
         try {
-            const response = await ctx.kugou.user.upgradeDayVip();
+            const response = assertApiSuccess(await ctx.kugou.user.upgradeDayVip(), '畅听会员升级失败');
             const message = getApiMessage(response, '已升级为畅听会员');
             await updateStatus('upgraded', day, message);
             if ('manual' === source || state.settings.notifySuccess) ctx.toast.success(message);
@@ -253,7 +298,7 @@ const createVipService = (ctx, state)=>{
         const previousStatus = state.status;
         await updateStatus('checking', day, '正在检查领取记录');
         try {
-            const record = await ctx.kugou.user.getVipMonthRecord();
+            const record = assertApiSuccess(await ctx.kugou.user.getVipMonthRecord(), '领取记录查询失败');
             state.monthRecord = record;
             if (hasClaimedDay(record, day)) {
                 if (state.settings.autoUpgrade) return performUpgrade(day, source, true, previousStatus);
@@ -280,7 +325,7 @@ const createVipService = (ctx, state)=>{
         await updateStatus('claiming', day, '正在领取当日 VIP');
         let claimResponse;
         try {
-            claimResponse = await ctx.kugou.user.claimDayVip(day);
+            claimResponse = assertApiSuccess(await ctx.kugou.user.claimDayVip(day), 'VIP 领取失败');
         } catch (error) {
             if (isAlreadyClaimedError(error)) {
                 if (state.settings.autoUpgrade) return performUpgrade(day, source, true, previousStatus);

@@ -3,6 +3,7 @@ import {
   AUTO_UPGRADE_RETRY_MS,
   DEFAULT_SETTINGS,
   EMPTY_STATUS,
+  assertApiSuccess,
   createVipService,
   formatChinaDay,
   getErrorMessage,
@@ -83,6 +84,19 @@ describe('core utilities', () => {
     );
   });
 
+  test('does not treat unrelated response dates as claim records', () => {
+    expect(
+      hasClaimedDay(
+        {
+          status: 1,
+          server_day: '2026-09-20',
+          data: { activity_start: '2026-09-20', records: [] },
+        },
+        '2026-09-20',
+      ),
+    ).toBe(false);
+  });
+
   test('detects an active svip from the VIP detail response', () => {
     expect(
       hasActiveSvip({
@@ -99,6 +113,15 @@ describe('core utilities', () => {
     const error = { response: { body: { status: 0, msg: '今日已领取' } } };
     expect(getErrorMessage(error)).toBe('今日已领取');
     expect(isAlreadyClaimedError(error)).toBe(true);
+  });
+
+  test('rejects resolved KuGou business failures', () => {
+    expect(() =>
+      assertApiSuccess(
+        { status: 0, error_code: 20028, error_msg: '领取条件不满足' },
+        'VIP 领取失败',
+      ),
+    ).toThrow('领取条件不满足');
   });
 });
 
@@ -169,6 +192,46 @@ describe('VIP service', () => {
     const result = await createVipService(ctx, createState()).upgrade();
     expect(result.ok).toBe(false);
     expect(calls.upgrade).toBe(0);
+  });
+
+  test('manual upgrade stops when the claim record cannot be checked', async () => {
+    const { ctx, calls } = createContext({
+      async getVipMonthRecord() {
+        calls.record += 1;
+        throw new Error('network unavailable');
+      },
+    });
+    const result = await createVipService(ctx, createState()).upgrade();
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain('无法升级');
+    expect(calls.upgrade).toBe(0);
+  });
+
+  test('does not report a resolved claim business failure as success', async () => {
+    const { ctx } = createContext({
+      async claimDayVip() {
+        return { status: 0, error_code: 20028, error_msg: '领取条件不满足' };
+      },
+    });
+    const state = createState();
+    const result = await createVipService(ctx, state).claimToday();
+    expect(result).toMatchObject({ ok: false, claimed: false });
+    expect(result.message).toBe('领取条件不满足');
+    expect(state.status.kind).toBe('error');
+  });
+
+  test('requires both VIP detail and claim record for a successful refresh', async () => {
+    const { ctx } = createContext({
+      async getUserVipDetail() {
+        return { status: 0, error_code: 20010, error_msg: '登录已过期' };
+      },
+    });
+    const state = createState();
+    const result = await createVipService(ctx, state).refresh();
+    expect(result).toBe(false);
+    expect(state.vipDetail).toBeNull();
+    expect(state.monthRecord).not.toBeNull();
+    expect(state.refreshing).toBe(false);
   });
 
   test('delays repeated automatic upgrade attempts after a recent failure', async () => {
