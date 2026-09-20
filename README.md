@@ -25,7 +25,15 @@ Rslib 将 `src/index.ts` 打包为 EchoMusic 加载的 `dist/index.js`，Rstest 
 
 ## 安装
 
-构建后，将整个仓库目录复制到 EchoMusic 插件目录，刷新插件列表并启用“酷狗概念版 VIP”。`dist/index.js`、`manifest.json`、`style.css` 和 `icon.svg` 必须同时存在。
+在 EchoMusic 的“插件管理 → 插件源”中添加：
+
+```text
+https://github.com/heyreborn/EchoMusicConceptVipPlugin
+```
+
+刷新在线插件列表后安装“酷狗概念版 VIP”。
+
+也可以将整个仓库目录复制到 EchoMusic 插件目录进行本地安装。`dist/index.js`、`manifest.json`、`style.css` 和 `icon.svg` 必须同时存在。
 
 ## 注意
 

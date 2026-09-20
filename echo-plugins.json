@@ -1,0 +1,13 @@
+{
+  "name": "EchoMusic 酷狗概念版 VIP 插件源",
+  "homepage": "https://github.com/heyreborn/EchoMusicConceptVipPlugin",
+  "plugins": [
+    {
+      "id": "kugou-concept-vip",
+      "path": "",
+      "repo": "https://github.com/heyreborn/EchoMusicConceptVipPlugin",
+      "homepage": "https://github.com/heyreborn/EchoMusicConceptVipPlugin",
+      "tags": ["kugou", "vip", "automation"]
+    }
+  ]
+}
