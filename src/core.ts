@@ -239,6 +239,10 @@ const createResult = (
   ...patch,
 });
 
+const hasSuccessfulStatusForDay = (status: ClaimStatus, day: string): boolean =>
+  status.day === day &&
+  ['claimed', 'already-claimed', 'upgraded', 'partial'].includes(status.kind);
+
 const saveStatus = async (
   ctx: EchoPluginContext,
   state: PluginState,
@@ -275,8 +279,11 @@ export const createVipService = (
       state.monthRecord = record;
       if (hasClaimedDay(record, day)) {
         await updateStatus('already-claimed', day, `${day} 已领取`);
-      } else if (options.reportFailure !== false) {
-        await updateStatus('idle', day, '今日尚未领取');
+      } else if (
+        options.reportFailure !== false &&
+        !hasSuccessfulStatusForDay(state.status, day)
+      ) {
+        await updateStatus('idle', day, '领取记录已刷新');
       }
       return true;
     } catch (error) {

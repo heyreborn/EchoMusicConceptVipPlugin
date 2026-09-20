@@ -157,6 +157,12 @@ const createResult = (patch)=>({
         upgraded: false,
         ...patch
     });
+const hasSuccessfulStatusForDay = (status, day)=>status.day === day && [
+        'claimed',
+        'already-claimed',
+        'upgraded',
+        'partial'
+    ].includes(status.kind);
 const saveStatus = async (ctx, state, status)=>{
     state.status = status;
     try {
@@ -180,7 +186,7 @@ const createVipService = (ctx, state)=>{
             const record = assertApiSuccess(await ctx.kugou.user.getVipMonthRecord(), '领取记录刷新失败');
             state.monthRecord = record;
             if (hasClaimedDay(record, day)) await updateStatus('already-claimed', day, `${day} 已领取`);
-            else if (false !== options.reportFailure) await updateStatus('idle', day, '今日尚未领取');
+            else if (false !== options.reportFailure && !hasSuccessfulStatusForDay(state.status, day)) await updateStatus('idle', day, '领取记录已刷新');
             return true;
         } catch (error) {
             if (false !== options.reportFailure) await updateStatus('error', day, `状态刷新失败：领取记录：${getErrorMessage(error, '查询失败')}`);

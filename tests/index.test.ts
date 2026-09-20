@@ -314,7 +314,26 @@ describe('VIP service', () => {
     };
     const result = await createVipService(ctx, state).refresh();
     expect(result).toBe(true);
-    expect(state.status).toMatchObject({ kind: 'idle', day: today, message: '今日尚未领取' });
+    expect(state.status).toMatchObject({ kind: 'idle', day: today, message: '领取记录已刷新' });
+  });
+
+  test('refresh preserves a successful status when records do not expose dates', async () => {
+    const today = formatChinaDay();
+    const { ctx } = createContext({
+      async getVipMonthRecord() {
+        return { status: 1, data: { claimed_days: 3 } };
+      },
+    });
+    const state = createState();
+    state.status = {
+      kind: 'claimed',
+      day: today,
+      message: '领取成功',
+      updatedAt: Date.now(),
+    };
+    const result = await createVipService(ctx, state).refresh();
+    expect(result).toBe(true);
+    expect(state.status).toMatchObject({ kind: 'claimed', day: today, message: '领取成功' });
   });
 
   test('delays repeated automatic upgrade attempts after a recent failure', async () => {
