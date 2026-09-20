@@ -1,16 +1,28 @@
 # EchoMusic 酷狗概念版 VIP 插件
 
-通过 EchoMusic 当前登录的酷狗账号领取概念版当日 VIP，并可选择升级为畅听会员。
+通过 EchoMusic 当前登录的酷狗账号直连酷狗网关，执行 VIP 领取、每日升级和可选的广告时长任务。
 
 ## 功能
 
-- 手动领取当日 VIP
-- 刷新当月领取记录和当前 VIP 信息
-- 可选启动后自动领取
-- 可选领取成功后自动升级畅听会员
-- 标题栏“更多”菜单快捷入口
+- 领取今天及未来 0–7 天，默认配置为未来 7 天
+- 支持指定单日 `YYYY-MM-DD` 领取
+- 可选启动后自动执行，启动延迟可设为 0–60 秒
+- 可选领取后每日升级会员
+- 可选执行每日 0–8 次广告时长任务
+- 查询当月领取记录、畅听/概念会员状态及到期时间
+- 按日期去重并保存最近 20 次执行记录
+- 支持执行全部、只领取、只升级、只执行广告和取消后续任务
+- 标题栏“更多”菜单提供今日领取快捷入口
 
-插件通过 `ctx.kugou.user` 复用 EchoMusic 的登录态、设备信息和请求签名，不读取或保存账号 token、Cookie。
+自动执行默认关闭；未来领取天数默认值为 7，只有用户主动开启自动执行后才会在启动时提交任务。广告任务属于实验性功能，默认关闭。
+
+## 实现方式
+
+插件不使用 `ctx.kugou`。它从 EchoMusic 的 Pinia 运行时读取当前酷狗登录态和设备信息，使用 `ctx.net.request` 直接请求酷狗网关，并在插件内实现概念版 Android 请求签名。
+
+插件不会把 Token、MID 或 DFID 复制到插件存储，也不会将这些字段写入执行历史。由于使用了直连网络能力，Manifest 声明了 `unrestrictedNetwork`。
+
+签名规则和 VIP 接口参数参考 KuGouMusicApi。KuGouMusicApi 使用 MIT License。
 
 ## 开发
 
@@ -21,7 +33,7 @@ pnpm run typecheck
 pnpm run build
 ```
 
-Rslib 将 `src/index.ts` 打包为 EchoMusic 加载的 `dist/index.js`，Rstest 用于测试日期、领取记录解析、错误处理和并发去重。
+Rslib 将 TypeScript 打包为 EchoMusic 加载的 `dist/index.js`，Rstest 覆盖签名、认证适配、日期序列、错误码、任务顺序、广告间隔和并发去重。
 
 ## 安装
 
@@ -33,14 +45,14 @@ https://github.com/heyreborn/EchoMusicConceptVipPlugin
 
 刷新在线插件列表后安装“酷狗概念版 VIP”。
 
-也可以将整个仓库目录复制到 EchoMusic 插件目录进行本地安装。`dist/index.js`、`manifest.json`、`style.css` 和 `icon.svg` 必须同时存在。
-
 ## 注意
 
-- 自动领取和自动升级默认关闭。
-- 自动模式无法确认当月领取记录时不会提交领取请求。
+- 需要先在 EchoMusic 登录酷狗账号并等待设备信息加载完成。
 - 日期统一按 `Asia/Shanghai` 计算。
-- 相关酷狗接口属于测试性质，活动规则或接口可用性可能变化。
+- 连续领取会顺序提交多次请求，遇到登录失效或网络错误会停止后续日期。
+- 广告任务每次间隔约 35 秒，全部执行可能需要数分钟。
+- Pinia 登录态属于 EchoMusic 运行时结构，未来主程序调整字段时可能需要同步更新插件。
+- 相关酷狗接口属于测试性质，活动规则、错误码或接口参数可能变化。
 
 ## License
 

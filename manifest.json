@@ -1,14 +1,14 @@
 {
   "id": "kugou-concept-vip",
   "name": "酷狗概念版 VIP",
-  "version": "0.1.8",
-  "description": "领取酷狗音乐概念版当日 VIP，并可选择升级为畅听会员。",
+  "version": "0.2.0",
+  "description": "直连酷狗领取概念版 VIP，支持未来日期、每日升级和广告时长任务。",
   "author": "EchoMusic Community",
   "icon": "icon.svg",
   "main": "dist/index.js",
   "style": "style.css",
   "capabilities": {
-    "kugouApi": true
+    "unrestrictedNetwork": true
   },
   "requires": {
     "echoMusicVersion": ">=2.3.2-beta.5"
