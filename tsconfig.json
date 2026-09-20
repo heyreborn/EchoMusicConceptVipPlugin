@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "target": "ES2022",
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "useDefineForClassFields": true,
+    "rootDir": "src",
+
+    /* modules */
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
+
+    /* type checking */
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "strict": true
+  },
+  "include": ["src"]
+}

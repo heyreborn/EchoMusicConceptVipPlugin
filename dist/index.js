@@ -1,0 +1,482 @@
+const SETTINGS_KEY = 'settings';
+const STATUS_KEY = 'last-status';
+const DEFAULT_SETTINGS = Object.freeze({
+    autoClaim: false,
+    autoUpgrade: false,
+    notifySuccess: true
+});
+const EMPTY_STATUS = Object.freeze({
+    kind: 'idle',
+    day: '',
+    message: '尚未执行',
+    updatedAt: 0
+});
+const asRecord = (value)=>null === value || 'object' != typeof value || Array.isArray(value) ? null : value;
+const normalizeSettings = (value)=>{
+    const source = asRecord(value);
+    return {
+        autoClaim: 'boolean' == typeof source?.autoClaim ? source.autoClaim : DEFAULT_SETTINGS.autoClaim,
+        autoUpgrade: 'boolean' == typeof source?.autoUpgrade ? source.autoUpgrade : DEFAULT_SETTINGS.autoUpgrade,
+        notifySuccess: 'boolean' == typeof source?.notifySuccess ? source.notifySuccess : DEFAULT_SETTINGS.notifySuccess
+    };
+};
+const normalizeStatus = (value)=>{
+    const source = asRecord(value);
+    const validKinds = new Set([
+        'idle',
+        'checking',
+        'claiming',
+        'claimed',
+        'already-claimed',
+        'upgraded',
+        'partial',
+        'error'
+    ]);
+    const kind = String(source?.kind ?? '');
+    return {
+        kind: validKinds.has(kind) ? kind : EMPTY_STATUS.kind,
+        day: 'string' == typeof source?.day ? source.day : EMPTY_STATUS.day,
+        message: 'string' == typeof source?.message ? source.message : EMPTY_STATUS.message,
+        updatedAt: 'number' == typeof source?.updatedAt && Number.isFinite(source.updatedAt) ? source.updatedAt : EMPTY_STATUS.updatedAt
+    };
+};
+const formatChinaDay = (date = new Date())=>{
+    const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Shanghai',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+    }).formatToParts(date);
+    const values = Object.fromEntries(parts.map((part)=>[
+            part.type,
+            part.value
+        ]));
+    return `${values.year}-${values.month}-${values.day}`;
+};
+const matchesDay = (value, day)=>{
+    if ('number' == typeof value) return String(value) === day.replaceAll('-', '');
+    if ('string' != typeof value) return false;
+    const normalized = value.trim();
+    return normalized === day || normalized === day.replaceAll('-', '') || normalized.startsWith(`${day}T`) || normalized.startsWith(`${day} `);
+};
+const hasClaimedDay = (payload, day)=>{
+    const seen = new WeakSet();
+    const visit = (value, depth)=>{
+        if (matchesDay(value, day)) return true;
+        if (depth > 10 || null === value || 'object' != typeof value) return false;
+        if (seen.has(value)) return false;
+        seen.add(value);
+        if (Array.isArray(value)) return value.some((item)=>visit(item, depth + 1));
+        return Object.values(value).some((item)=>visit(item, depth + 1));
+    };
+    return visit(payload, 0);
+};
+const findMessage = (value, depth = 0)=>{
+    if (depth > 5) return '';
+    if ('string' == typeof value) return value.trim();
+    if (null === value || 'object' != typeof value) return '';
+    const record = asRecord(value);
+    if (record) {
+        for (const key of [
+            'msg',
+            'message',
+            'error',
+            'errmsg',
+            'error_msg'
+        ]){
+            const candidate = record[key];
+            if ('string' == typeof candidate && candidate.trim()) return candidate.trim();
+        }
+        for (const candidate of Object.values(record)){
+            const message = findMessage(candidate, depth + 1);
+            if (message) return message;
+        }
+    }
+    return '';
+};
+const getErrorMessage = (error, fallback = '操作失败')=>{
+    const record = asRecord(error);
+    const response = asRecord(record?.response);
+    return findMessage(response?.body) || findMessage(record) || (error instanceof Error ? error.message : '') || fallback;
+};
+const isAlreadyClaimedError = (error)=>/(已领取|领取过|重复领取|不可重复|already\s*(claimed|received))/i.test(getErrorMessage(error, ''));
+const getApiMessage = (payload, fallback)=>findMessage(payload) || fallback;
+const createResult = (patch)=>({
+        claimed: false,
+        alreadyClaimed: false,
+        upgraded: false,
+        ...patch
+    });
+const saveStatus = async (ctx, state, status)=>{
+    state.status = status;
+    try {
+        await ctx.storage.set(STATUS_KEY, status);
+    } catch (error) {
+        console.warn('[kugou-concept-vip] 保存状态失败', error);
+    }
+};
+const createVipService = (ctx, state)=>{
+    let claimInFlight = null;
+    const updateStatus = (kind, day, message)=>saveStatus(ctx, state, {
+            kind,
+            day,
+            message,
+            updatedAt: Date.now()
+        });
+    const refresh = async ()=>{
+        state.refreshing = true;
+        const [vipResult, recordResult] = await Promise.allSettled([
+            ctx.kugou.user.getUserVipDetail(),
+            ctx.kugou.user.getVipMonthRecord()
+        ]);
+        state.refreshing = false;
+        if ('fulfilled' === vipResult.status) state.vipDetail = vipResult.value;
+        if ('fulfilled' === recordResult.status) state.monthRecord = recordResult.value;
+        return 'fulfilled' === vipResult.status || 'fulfilled' === recordResult.status;
+    };
+    const runClaim = async (options)=>{
+        const source = options.source ?? 'manual';
+        const day = formatChinaDay();
+        await updateStatus('checking', day, '正在检查领取记录');
+        try {
+            const record = await ctx.kugou.user.getVipMonthRecord();
+            state.monthRecord = record;
+            if (hasClaimedDay(record, day)) {
+                const message = `${day} 已领取`;
+                await updateStatus('already-claimed', day, message);
+                if ('manual' === source) ctx.toast.info(message);
+                return createResult({
+                    ok: true,
+                    alreadyClaimed: true,
+                    message
+                });
+            }
+        } catch (error) {
+            if ('auto' === source) {
+                const message = `自动领取已跳过：${getErrorMessage(error, '无法确认领取记录')}`;
+                await updateStatus('error', day, message);
+                return createResult({
+                    ok: false,
+                    message
+                });
+            }
+        }
+        await updateStatus('claiming', day, '正在领取当日 VIP');
+        let claimResponse;
+        try {
+            claimResponse = await ctx.kugou.user.claimDayVip(day);
+        } catch (error) {
+            if (isAlreadyClaimedError(error)) {
+                const message = `${day} 已领取`;
+                await updateStatus('already-claimed', day, message);
+                if ('manual' === source) ctx.toast.info(message);
+                return createResult({
+                    ok: true,
+                    alreadyClaimed: true,
+                    message
+                });
+            }
+            const message = getErrorMessage(error, 'VIP 领取失败');
+            await updateStatus('error', day, message);
+            if ('manual' === source) ctx.toast.danger(message);
+            return createResult({
+                ok: false,
+                message
+            });
+        }
+        if (state.settings.autoUpgrade) try {
+            const upgradeResponse = await ctx.kugou.user.upgradeDayVip();
+            const message = getApiMessage(upgradeResponse, 'VIP 已领取并升级为畅听会员');
+            await updateStatus('upgraded', day, message);
+            if ('manual' === source || state.settings.notifySuccess) ctx.toast.success(message);
+            refresh();
+            return createResult({
+                ok: true,
+                claimed: true,
+                upgraded: true,
+                message
+            });
+        } catch (error) {
+            const message = `VIP 已领取，但升级失败：${getErrorMessage(error)}`;
+            await updateStatus('partial', day, message);
+            if ('manual' === source || state.settings.notifySuccess) ctx.toast.warning(message);
+            refresh();
+            return createResult({
+                ok: true,
+                claimed: true,
+                message
+            });
+        }
+        const message = getApiMessage(claimResponse, '今日概念版 VIP 领取成功');
+        await updateStatus('claimed', day, message);
+        if ('manual' === source || state.settings.notifySuccess) ctx.toast.success(message);
+        refresh();
+        return createResult({
+            ok: true,
+            claimed: true,
+            message
+        });
+    };
+    const claimToday = (options = {})=>{
+        if (claimInFlight) return claimInFlight;
+        claimInFlight = runClaim(options).finally(()=>{
+            claimInFlight = null;
+        });
+        return claimInFlight;
+    };
+    const upgrade = async ()=>{
+        const day = formatChinaDay();
+        try {
+            const response = await ctx.kugou.user.upgradeDayVip();
+            const message = getApiMessage(response, '已升级为畅听会员');
+            await updateStatus('upgraded', day, message);
+            ctx.toast.success(message);
+            refresh();
+            return createResult({
+                ok: true,
+                claimed: true,
+                upgraded: true,
+                message
+            });
+        } catch (error) {
+            const message = getErrorMessage(error, '升级失败');
+            await updateStatus('error', day, message);
+            ctx.toast.danger(message);
+            return createResult({
+                ok: false,
+                message
+            });
+        }
+    };
+    return {
+        claimToday,
+        upgrade,
+        refresh
+    };
+};
+const AUTO_CHECK_INTERVAL_MS = 1800000;
+const INITIAL_AUTO_CHECK_DELAY_MS = 3000;
+const statusLabel = (state)=>{
+    const labels = {
+        idle: '尚未执行',
+        checking: '检查中',
+        claiming: '领取中',
+        claimed: '已领取',
+        'already-claimed': '今日已领取',
+        upgraded: '已升级',
+        partial: '部分完成',
+        error: '执行失败'
+    };
+    return labels[state.status.kind];
+};
+const formatUpdatedAt = (timestamp)=>{
+    if (!timestamp) return '--';
+    return new Intl.DateTimeFormat('zh-CN', {
+        timeZone: 'Asia/Shanghai',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false
+    }).format(new Date(timestamp));
+};
+const createSettingsComponent = (ctx, state, service)=>ctx.vue.defineComponent({
+        name: 'KugouConceptVipSettings',
+        setup () {
+            const { computed, defineAsyncComponent, h, onMounted, reactive, ref } = ctx.vue;
+            const Button = defineAsyncComponent(ctx.ui.components.Button);
+            const Switch = defineAsyncComponent(ctx.ui.components.Switch);
+            const draft = reactive(normalizeSettings(state.settings));
+            const saving = ref(false);
+            const action = ref('');
+            const busy = computed(()=>'' !== action.value || 'checking' === state.status.kind || 'claiming' === state.status.kind);
+            onMounted(()=>{
+                action.value = 'refresh';
+                service.refresh().finally(()=>{
+                    action.value = '';
+                });
+            });
+            const save = async ()=>{
+                if (saving.value) return;
+                saving.value = true;
+                try {
+                    const settings = normalizeSettings({
+                        ...draft
+                    });
+                    await ctx.storage.set(SETTINGS_KEY, settings);
+                    state.settings = settings;
+                    ctx.toast.success('设置已保存');
+                } catch (error) {
+                    ctx.toast.danger(error instanceof Error ? error.message : '设置保存失败');
+                } finally{
+                    saving.value = false;
+                }
+            };
+            const claim = async ()=>{
+                if (busy.value) return;
+                action.value = 'claim';
+                try {
+                    await service.claimToday({
+                        source: 'manual'
+                    });
+                } finally{
+                    action.value = '';
+                }
+            };
+            const upgrade = async ()=>{
+                if (busy.value) return;
+                action.value = 'upgrade';
+                try {
+                    await service.upgrade();
+                } finally{
+                    action.value = '';
+                }
+            };
+            const refresh = async ()=>{
+                if (busy.value) return;
+                action.value = 'refresh';
+                try {
+                    const ok = await service.refresh();
+                    ctx.toast[ok ? 'success' : 'warning'](ok ? '会员状态已刷新' : '状态刷新失败');
+                } finally{
+                    action.value = '';
+                }
+            };
+            const switchRow = (label, key, disabled = false)=>h('label', {
+                    class: 'echo-vip-switch-row'
+                }, [
+                    h('span', label),
+                    h(Switch, {
+                        modelValue: draft[key],
+                        disabled,
+                        'onUpdate:modelValue': (value)=>{
+                            draft[key] = Boolean(value);
+                        }
+                    })
+                ]);
+            const button = (label, props)=>h(Button, props, {
+                    default: ()=>label
+                });
+            return ()=>h('div', {
+                    class: 'echo-vip-settings'
+                }, [
+                    h('section', {
+                        class: 'echo-vip-status'
+                    }, [
+                        h('div', {
+                            class: 'echo-vip-status-main'
+                        }, [
+                            h('span', {
+                                class: `echo-vip-state is-${state.status.kind}`
+                            }, statusLabel(state)),
+                            h('strong', state.status.message || '尚未执行')
+                        ]),
+                        h('dl', {
+                            class: 'echo-vip-meta'
+                        }, [
+                            h('div', [
+                                h('dt', '领取日期'),
+                                h('dd', state.status.day || '--')
+                            ]),
+                            h('div', [
+                                h('dt', '更新时间'),
+                                h('dd', formatUpdatedAt(state.status.updatedAt))
+                            ]),
+                            h('div', [
+                                h('dt', '本月记录'),
+                                h('dd', state.monthRecord ? '已获取' : '未获取')
+                            ])
+                        ])
+                    ]),
+                    h('section', {
+                        class: 'echo-vip-actions'
+                    }, [
+                        button('claim' === action.value ? '领取中...' : '领取今日 VIP', {
+                            variant: 'primary',
+                            size: 'sm',
+                            loading: 'claim' === action.value,
+                            disabled: busy.value,
+                            onClick: claim
+                        }),
+                        button('upgrade' === action.value ? '升级中...' : '升级畅听会员', {
+                            variant: 'outline',
+                            size: 'sm',
+                            loading: 'upgrade' === action.value,
+                            disabled: busy.value,
+                            onClick: upgrade
+                        }),
+                        button('refresh' === action.value ? '刷新中...' : '刷新状态', {
+                            variant: 'ghost',
+                            size: 'sm',
+                            loading: 'refresh' === action.value,
+                            disabled: busy.value,
+                            onClick: refresh
+                        })
+                    ]),
+                    h('section', {
+                        class: 'echo-vip-options'
+                    }, [
+                        switchRow('启动后自动领取', 'autoClaim'),
+                        switchRow('领取后自动升级', 'autoUpgrade'),
+                        switchRow('自动领取成功时通知', 'notifySuccess', !draft.autoClaim)
+                    ]),
+                    h('div', {
+                        class: 'echo-vip-footer'
+                    }, [
+                        button(saving.value ? '保存中...' : '保存设置', {
+                            variant: 'primary',
+                            size: 'sm',
+                            loading: saving.value,
+                            disabled: saving.value,
+                            onClick: save
+                        })
+                    ])
+                ]);
+        }
+    });
+async function activate(ctx) {
+    const [savedSettings, savedStatus] = await Promise.all([
+        ctx.storage.get(SETTINGS_KEY),
+        ctx.storage.get(STATUS_KEY)
+    ]);
+    const state = ctx.vue.reactive({
+        settings: normalizeSettings(savedSettings),
+        status: normalizeStatus(savedStatus),
+        monthRecord: null,
+        vipDetail: null,
+        refreshing: false
+    });
+    const service = createVipService(ctx, state);
+    ctx.ui.settings.define({
+        title: '酷狗概念版 VIP',
+        component: createSettingsComponent(ctx, state, service)
+    });
+    ctx.ui.titlebar.register({
+        id: 'claim-today',
+        title: '领取今日 VIP',
+        tooltip: '领取酷狗概念版今日 VIP',
+        icon: 'tabler:gift',
+        defaultPlacement: 'more',
+        order: 300,
+        disabled: ()=>'checking' === state.status.kind || 'claiming' === state.status.kind,
+        onClick: ()=>service.claimToday({
+                source: 'manual'
+            })
+    });
+    const runAutoClaim = ()=>{
+        if (!state.settings.autoClaim) return;
+        service.claimToday({
+            source: 'auto'
+        });
+    };
+    const startupTimer = window.setTimeout(runAutoClaim, INITIAL_AUTO_CHECK_DELAY_MS);
+    const intervalTimer = window.setInterval(runAutoClaim, AUTO_CHECK_INTERVAL_MS);
+    ctx.dispose(()=>{
+        window.clearTimeout(startupTimer);
+        window.clearInterval(intervalTimer);
+    });
+}
+function deactivate() {}
+export { DEFAULT_SETTINGS, activate, deactivate, formatChinaDay, hasClaimedDay };

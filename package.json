@@ -1,0 +1,31 @@
+{
+  "name": "echomusic-kugou-concept-vip",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "dist/index.js",
+    "manifest.json",
+    "style.css",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rslib",
+    "dev": "rslib --watch",
+    "test": "rstest",
+    "test:watch": "rstest --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@rslib/core": "^1.0.1",
+    "@rstest/adapter-rslib": "^0.11.12",
+    "@rstest/core": "^0.11.12",
+    "@types/node": "^24.13.4",
+    "typescript": "^6.0.3"
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  }
+}
