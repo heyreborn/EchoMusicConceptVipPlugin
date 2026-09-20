@@ -166,7 +166,7 @@ describe('VIP service', () => {
     expect(calls.upgrade).toBe(1);
   });
 
-  test('does not call the upgrade endpoint for an active svip account', async () => {
+  test('lets the upgrade endpoint decide even when SVIP detail is active', async () => {
     const today = formatChinaDay();
     const { ctx, calls } = createContext({
       async getVipMonthRecord() {
@@ -184,17 +184,10 @@ describe('VIP service', () => {
     state.settings.autoUpgrade = true;
     const result = await createVipService(ctx, state).claimToday();
     expect(result).toMatchObject({ ok: true, upgraded: true });
-    expect(calls.upgrade).toBe(0);
+    expect(calls.upgrade).toBe(1);
   });
 
-  test('manual upgrade requires the current day to be claimed', async () => {
-    const { ctx, calls } = createContext();
-    const result = await createVipService(ctx, createState()).upgrade();
-    expect(result.ok).toBe(false);
-    expect(calls.upgrade).toBe(0);
-  });
-
-  test('manual upgrade stops when the claim record cannot be checked', async () => {
+  test('manual upgrade lets the upgrade endpoint decide eligibility', async () => {
     const { ctx, calls } = createContext({
       async getVipMonthRecord() {
         calls.record += 1;
@@ -202,9 +195,23 @@ describe('VIP service', () => {
       },
     });
     const result = await createVipService(ctx, createState()).upgrade();
-    expect(result.ok).toBe(false);
-    expect(result.message).toContain('无法升级');
-    expect(calls.upgrade).toBe(0);
+    expect(result.ok).toBe(true);
+    expect(calls.upgrade).toBe(1);
+  });
+
+  test('manual upgrade reports the endpoint prerequisite error without assuming a claim', async () => {
+    const { ctx, calls } = createContext({
+      async upgradeDayVip() {
+        calls.upgrade += 1;
+        throw { response: { body: { status: 0, msg: '请先领取今日 VIP' } } };
+      },
+    });
+    const state = createState();
+    const result = await createVipService(ctx, state).upgrade();
+    expect(result).toMatchObject({ ok: false, claimed: false });
+    expect(result.message).toContain('请先领取今日 VIP');
+    expect(state.status.kind).toBe('error');
+    expect(calls.upgrade).toBe(1);
   });
 
   test('does not report a resolved claim business failure as success', async () => {
@@ -232,6 +239,19 @@ describe('VIP service', () => {
     expect(state.vipDetail).toBeNull();
     expect(state.monthRecord).not.toBeNull();
     expect(state.refreshing).toBe(false);
+  });
+
+  test('refresh derives today claimed status from the month record', async () => {
+    const today = formatChinaDay();
+    const { ctx } = createContext({
+      async getVipMonthRecord() {
+        return { status: 1, data: [{ receive_day: today }] };
+      },
+    });
+    const state = createState();
+    const result = await createVipService(ctx, state).refresh();
+    expect(result).toBe(true);
+    expect(state.status).toMatchObject({ kind: 'already-claimed', day: today });
   });
 
   test('delays repeated automatic upgrade attempts after a recent failure', async () => {

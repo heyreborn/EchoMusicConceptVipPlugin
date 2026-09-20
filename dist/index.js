@@ -95,19 +95,6 @@ const hasClaimedDay = (payload, day)=>{
     };
     return visit(payload, 0);
 };
-const hasActiveSvip = (payload)=>{
-    const seen = new WeakSet();
-    const visit = (value, depth)=>{
-        if (depth > 10 || null === value || 'object' != typeof value) return false;
-        if (seen.has(value)) return false;
-        seen.add(value);
-        if (Array.isArray(value)) return value.some((item)=>visit(item, depth + 1));
-        const record = value;
-        if ('svip' === String(record.product_type ?? '').toLowerCase() && 1 === Number(record.is_vip)) return true;
-        return Object.values(record).some((item)=>visit(item, depth + 1));
-    };
-    return visit(payload, 0);
-};
 const findMessage = (value, depth = 0)=>{
     if (depth > 5) return '';
     if ('string' == typeof value) return value.trim();
@@ -193,6 +180,12 @@ const createVipService = (ctx, state)=>{
         state.refreshing = false;
         if ('fulfilled' === vipResult.status) state.vipDetail = vipResult.value;
         if ('fulfilled' === recordResult.status) state.monthRecord = recordResult.value;
+        const day = formatChinaDay();
+        if ('fulfilled' === recordResult.status && hasClaimedDay(recordResult.value, day)) await updateStatus('already-claimed', day, `${day} 已领取`);
+        else if ('fulfilled' === vipResult.status && 'fulfilled' === recordResult.status) {
+            const currentIsToday = state.status.day === day && 'idle' !== state.status.kind;
+            if (!currentIsToday) await updateStatus('idle', day, '会员状态和领取记录已刷新');
+        }
         return 'fulfilled' === vipResult.status && 'fulfilled' === recordResult.status;
     };
     const runExclusive = (operation)=>{
@@ -201,21 +194,6 @@ const createVipService = (ctx, state)=>{
             operationInFlight = null;
         });
         return operationInFlight;
-    };
-    const readVipDetail = async ()=>{
-        try {
-            const detail = assertApiSuccess(await ctx.kugou.user.getUserVipDetail(), '会员信息查询失败');
-            state.vipDetail = detail;
-            return {
-                available: true,
-                detail
-            };
-        } catch  {
-            return {
-                available: false,
-                detail: null
-            };
-        }
     };
     const finishAlreadyUpgraded = async (day, source)=>{
         const message = '当前账号已是畅听会员';
@@ -240,31 +218,26 @@ const createVipService = (ctx, state)=>{
                 message
             });
         }
-        if (!knownClaimed) try {
+        if (!knownClaimed && 'auto' === source) try {
             const record = assertApiSuccess(await ctx.kugou.user.getVipMonthRecord(), '领取记录查询失败');
             state.monthRecord = record;
             if (!hasClaimedDay(record, day)) {
                 const message = '请先领取今日 VIP，再升级畅听会员';
                 await updateStatus('idle', day, message);
-                if ('manual' === source) ctx.toast.warning(message);
                 return createResult({
                     ok: false,
                     message
                 });
             }
         } catch (error) {
-            const prefix = 'auto' === source ? '自动升级已跳过' : '无法升级';
-            const message = `${prefix}：${getErrorMessage(error, '无法确认领取记录')}`;
+            const message = `自动升级已跳过：${getErrorMessage(error, '无法确认领取记录')}`;
             await updateStatus('error', day, message);
-            if ('manual' === source) ctx.toast.warning(message);
             return createResult({
                 ok: false,
                 message
             });
         }
-        const vip = await readVipDetail();
-        if (vip.available && hasActiveSvip(vip.detail)) return finishAlreadyUpgraded(day, source);
-        if (!vip.available && previousStatus?.kind === 'upgraded' && previousStatus.day === day) return finishAlreadyUpgraded(day, source);
+        if (previousStatus?.kind === 'upgraded' && previousStatus.day === day) return finishAlreadyUpgraded(day, source);
         await updateStatus('upgrading', day, '正在升级畅听会员');
         try {
             const response = assertApiSuccess(await ctx.kugou.user.upgradeDayVip(), '畅听会员升级失败');
@@ -280,14 +253,12 @@ const createVipService = (ctx, state)=>{
             });
         } catch (error) {
             if (isAlreadyUpgradedError(error)) return finishAlreadyUpgraded(day, source);
-            const detailAfterFailure = await readVipDetail();
-            if (detailAfterFailure.available && hasActiveSvip(detailAfterFailure.detail)) return finishAlreadyUpgraded(day, source);
-            const message = `VIP 已领取，但升级失败：${getErrorMessage(error)}`;
-            await updateStatus('partial', day, message);
+            const message = knownClaimed ? `VIP 已领取，但升级失败：${getErrorMessage(error)}` : `畅听会员升级失败：${getErrorMessage(error)}`;
+            await updateStatus(knownClaimed ? 'partial' : 'error', day, message);
             if ('manual' === source || state.settings.notifySuccess) ctx.toast.warning(message);
             return createResult({
                 ok: false,
-                claimed: true,
+                claimed: knownClaimed,
                 message
             });
         }
