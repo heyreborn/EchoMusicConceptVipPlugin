@@ -1,4 +1,5 @@
 import {
+  EMPTY_STATUS,
   SETTINGS_KEY,
   STATUS_KEY,
   createVipService,
@@ -7,6 +8,7 @@ import {
 } from './core';
 import type {
   EchoPluginContext,
+  ClaimStatus,
   PluginSettings,
   PluginState,
   VipService,
@@ -15,8 +17,8 @@ import type {
 const AUTO_CHECK_INTERVAL_MS = 30 * 60 * 1000;
 const INITIAL_AUTO_CHECK_DELAY_MS = 3000;
 
-const statusLabel = (state: PluginState): string => {
-  const labels: Record<PluginState['status']['kind'], string> = {
+const statusLabel = (status: ClaimStatus): string => {
+  const labels: Record<ClaimStatus['kind'], string> = {
     idle: '尚未执行',
     checking: '检查中',
     claiming: '领取中',
@@ -27,7 +29,20 @@ const statusLabel = (state: PluginState): string => {
     partial: '部分完成',
     error: '执行失败',
   };
-  return labels[state.status.kind];
+  return labels[status.kind];
+};
+
+const INITIAL_DIALOG_STATUS: ClaimStatus = {
+  ...EMPTY_STATUS,
+  kind: 'checking',
+  message: '正在刷新会员状态',
+};
+
+const getSettingsDialogCloseButton = (event: Event): HTMLButtonElement | null => {
+  const target = event.currentTarget;
+  if (!(target instanceof Element)) return null;
+  const dialog = target.closest('[role="dialog"]');
+  return dialog?.querySelector<HTMLButtonElement>('.dialog-close') ?? null;
 };
 
 const formatUpdatedAt = (timestamp: number): string => {
@@ -59,6 +74,13 @@ const createSettingsComponent = (
       const draft = reactive<PluginSettings>(normalizeSettings(state.settings));
       const saving = ref(false);
       const action = ref<Action>('');
+      const statusReady = ref(false);
+      const visibleStatus = computed(() =>
+        statusReady.value ? state.status : INITIAL_DIALOG_STATUS,
+      );
+      const hasCurrentMonthRecord = computed(
+        () => statusReady.value && state.monthRecord !== null,
+      );
       const busy = computed(
         () =>
           action.value !== '' ||
@@ -68,20 +90,24 @@ const createSettingsComponent = (
       );
 
       onMounted(() => {
+        statusReady.value = false;
         action.value = 'refresh';
         void service.refresh().finally(() => {
+          statusReady.value = true;
           action.value = '';
         });
       });
 
-      const save = async () => {
+      const save = async (event: Event) => {
         if (saving.value) return;
+        const closeButton = getSettingsDialogCloseButton(event);
         saving.value = true;
         try {
           const settings = normalizeSettings({ ...draft });
           await ctx.storage.set(SETTINGS_KEY, settings);
           state.settings = settings;
           ctx.toast.success('设置已保存');
+          closeButton?.click();
         } catch (error) {
           ctx.toast.danger(error instanceof Error ? error.message : '设置保存失败');
         } finally {
@@ -91,6 +117,7 @@ const createSettingsComponent = (
 
       const claim = async () => {
         if (busy.value) return;
+        statusReady.value = true;
         action.value = 'claim';
         try {
           await service.claimToday({ source: 'manual' });
@@ -101,6 +128,7 @@ const createSettingsComponent = (
 
       const upgrade = async () => {
         if (busy.value) return;
+        statusReady.value = true;
         action.value = 'upgrade';
         try {
           await service.upgrade();
@@ -111,13 +139,16 @@ const createSettingsComponent = (
 
       const refresh = async () => {
         if (busy.value) return;
+        statusReady.value = false;
         action.value = 'refresh';
         try {
           const ok = await service.refresh();
+          statusReady.value = true;
           ctx.toast[ok ? 'success' : 'warning'](
             ok ? '会员状态已刷新' : state.status.message || '状态刷新失败',
           );
         } finally {
+          statusReady.value = true;
           action.value = '';
         }
       };
@@ -145,15 +176,22 @@ const createSettingsComponent = (
         h('div', { class: 'echo-vip-settings' }, [
           h('section', { class: 'echo-vip-status' }, [
             h('div', { class: 'echo-vip-status-main' }, [
-              h('span', { class: `echo-vip-state is-${state.status.kind}` }, statusLabel(state)),
-              h('strong', state.status.message || '尚未执行'),
+              h(
+                'span',
+                { class: `echo-vip-state is-${visibleStatus.value.kind}` },
+                statusLabel(visibleStatus.value),
+              ),
+              h('strong', visibleStatus.value.message || '尚未执行'),
             ]),
             h('dl', { class: 'echo-vip-meta' }, [
-              h('div', [h('dt', '领取日期'), h('dd', state.status.day || '--')]),
-              h('div', [h('dt', '更新时间'), h('dd', formatUpdatedAt(state.status.updatedAt))]),
+              h('div', [h('dt', '领取日期'), h('dd', visibleStatus.value.day || '--')]),
+              h('div', [
+                h('dt', '更新时间'),
+                h('dd', formatUpdatedAt(visibleStatus.value.updatedAt)),
+              ]),
               h('div', [
                 h('dt', '本月记录'),
-                h('dd', state.monthRecord ? '已获取' : '未获取'),
+                h('dd', hasCurrentMonthRecord.value ? '已获取' : '未获取'),
               ]),
             ]),
           ]),
