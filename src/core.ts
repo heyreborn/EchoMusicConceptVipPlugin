@@ -210,6 +210,9 @@ export const isAlreadyClaimedResult = (result: KugouApiResult): boolean =>
 export const isAlreadyUpgradedResult = (result: KugouApiResult): boolean =>
   result.code === 297002 || /已经领取过升级|已升级|重复升级/.test(result.message);
 
+export const isFutureDurationInsufficient = (result: KugouApiResult): boolean =>
+  /未来.*时长不足|未来时长不足/.test(result.message);
+
 const createResult = (
   patch: Partial<ClaimResult> & Pick<ClaimResult, 'ok' | 'message'>,
 ): ClaimResult => ({ claimed: false, alreadyClaimed: false, upgraded: false, ...patch });
@@ -262,12 +265,18 @@ export const createVipService = (
     await persist();
   };
 
-  const claimDates = async (options: RunOptions, todayOnly: boolean): Promise<ClaimResult> => {
+  const claimDates = async (
+    options: RunOptions,
+    scope: 'configured' | 'today' | 'future',
+  ): Promise<ClaimResult> => {
     client.getAuth();
-    const settings = todayOnly
-      ? { ...state.settings, futureDays: 0, receiveDay: 'auto' }
-      : state.settings;
-    const dates = buildTargetDates(settings, now());
+    const today = formatChinaDay(now());
+    const configuredDates = buildTargetDates(state.settings, now());
+    const dates = scope === 'today'
+      ? [today]
+      : scope === 'future'
+        ? configuredDates.filter((day) => day !== today)
+        : configuredDates;
     const targets = options.force
       ? dates
       : dates.filter((day) => !state.persisted.claimedDates[day]?.ok);
@@ -280,6 +289,7 @@ export const createVipService = (
     let claimed = 0;
     let already = 0;
     const failures: string[] = [];
+    let insufficientDay = '';
     for (let index = 0; index < targets.length; index += 1) {
       if (state.cancelRequested) break;
       if (index > 0) await sleep(CLAIM_TASK_INTERVAL_MS);
@@ -303,6 +313,10 @@ export const createVipService = (
           continue;
         }
         failures.push(`${day}: ${result.message}`);
+        if (isFutureDurationInsufficient(result)) {
+          insufficientDay = day;
+          break;
+        }
         if (result.code === 20018) break;
       } catch (error) {
         failures.push(`${day}: ${error instanceof Error ? error.message : '网络请求失败'}`);
@@ -318,7 +332,8 @@ export const createVipService = (
     const parts = [
       claimed ? `新领取 ${claimed} 天` : '',
       already ? `${already} 天已领取` : '',
-      failures.length ? `失败 ${failures.length} 天：${failures[0]}` : '',
+      insufficientDay ? `未来时长不足，已停在 ${insufficientDay}` : '',
+      failures.length && !insufficientDay ? `失败 ${failures.length} 天：${failures[0]}` : '',
     ].filter(Boolean);
     const message = parts.join('；') || '领取任务已完成';
     setStatus(
@@ -475,36 +490,46 @@ export const createVipService = (
   };
 
   const claimConfigured = (options: RunOptions = {}) =>
-    execute(options.source ?? 'manual', () => claimDates(options, false));
+    execute(options.source ?? 'manual', () => claimDates(options, 'configured'));
   const claimToday = (options: RunOptions = {}) =>
-    execute(options.source ?? 'manual', () => claimDates(options, true));
+    execute(options.source ?? 'manual', () => claimDates(options, 'today'));
   const runAds = (options: RunOptions = {}) =>
     execute(options.source ?? 'manual', () => runAdsInternal({ ...options, includeAds: true }));
   const upgrade = (options: RunOptions = {}) =>
     execute(options.source ?? 'manual', () => upgradeInternal(options));
   const runAll = (options: RunOptions = {}) =>
     execute(options.source ?? 'manual', async () => {
-      const claim = await claimDates(options, false);
-      const messages = [claim.message];
-      let ok = claim.ok;
+      const usesAutomaticDates = state.settings.receiveDay.trim().toLowerCase() === 'auto';
+      const initialClaim = await claimDates(options, usesAutomaticDates ? 'today' : 'configured');
+      const messages = [initialClaim.message];
+      let ok = initialClaim.ok;
+      let claimed = initialClaim.claimed;
+      let alreadyClaimed = initialClaim.alreadyClaimed;
       let upgraded = false;
-      if (!claim.ok && !claim.claimed) return claim;
-      if (!state.cancelRequested && (state.settings.adEnabled || options.includeAds)) {
-        const ads = await runAdsInternal(options);
-        messages.push(ads.message);
-        ok = ok && ads.ok;
-      }
+      if (!initialClaim.ok && !initialClaim.claimed) return initialClaim;
       if (!state.cancelRequested && (state.settings.autoUpgrade || options.includeUpgrade)) {
         const upgradeResult = await upgradeInternal(options);
         messages.push(upgradeResult.message);
         ok = ok && upgradeResult.ok;
         upgraded = upgradeResult.upgraded;
       }
+      if (!state.cancelRequested && (state.settings.adEnabled || options.includeAds)) {
+        const ads = await runAdsInternal(options);
+        messages.push(ads.message);
+        ok = ok && ads.ok;
+      }
+      if (!state.cancelRequested && usesAutomaticDates && state.settings.futureDays > 0) {
+        const futureClaim = await claimDates(options, 'future');
+        messages.push(futureClaim.message);
+        ok = ok && futureClaim.ok;
+        claimed = claimed || futureClaim.claimed;
+        alreadyClaimed = alreadyClaimed || futureClaim.alreadyClaimed;
+      }
       const message = messages.filter(Boolean).join('；');
-      if (state.cancelRequested) return createResult({ ok: false, claimed: claim.claimed, upgraded, canceled: true, message });
-      setStatus(ok ? (upgraded ? 'upgraded' : claim.claimed ? 'claimed' : 'idle') : claim.claimed ? 'partial' : 'error', formatChinaDay(now()), message);
+      if (state.cancelRequested) return createResult({ ok: false, claimed, upgraded, canceled: true, message });
+      setStatus(ok ? (upgraded ? 'upgraded' : claimed ? 'claimed' : 'idle') : claimed ? 'partial' : 'error', formatChinaDay(now()), message);
       void refresh({ reportFailure: false });
-      return createResult({ ok, claimed: claim.claimed, alreadyClaimed: claim.alreadyClaimed, upgraded, message });
+      return createResult({ ok, claimed, alreadyClaimed, upgraded, message });
     });
 
   return {

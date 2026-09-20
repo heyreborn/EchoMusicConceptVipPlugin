@@ -226,10 +226,10 @@ const createSettingsComponent = (
           ]),
 
           h('section', { class: 'echo-vip-options' }, [
-            switchRow('启动后自动执行', '按照启动延迟执行领取、广告和升级任务', 'autoClaim'),
+            switchRow('启动后自动执行', '先领取今天，再升级、执行广告并领取未来日期', 'autoClaim'),
             sliderRow('未来领取天数', '0 表示只领取今天，7 表示今天及未来七天', 'futureDays', 7, ' 天'),
             sliderRow('启动延迟', '等待 EchoMusic 登录态和设备信息加载', 'delaySeconds', 60, ' 秒'),
-            switchRow('领取后自动升级', '领取流程完成后提交每日升级任务', 'autoUpgrade'),
+            switchRow('领取后自动升级', '领取今天后先增加概念会员时长，再尝试未来日期', 'autoUpgrade'),
             switchRow('模拟广告任务', '实验性功能，通过酷狗网关提交广告完成记录', 'adEnabled'),
             sliderRow('每日广告次数', '每次间隔约 35 秒，每日最多 8 次', 'adCount', 8, ' 次', !draft.adEnabled),
             switchRow('自动任务结果通知', '自动执行结束后显示应用内通知', 'notifySuccess'),

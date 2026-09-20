@@ -239,6 +239,23 @@ describe('task service', () => {
     expect(calls.claim).toHaveLength(1);
   });
 
+  test('stops after the first future duration limit', async () => {
+    const { ctx } = createContext();
+    const { client, calls } = createClient({ claimDayVip: async (day) => {
+      calls.claim.push(day);
+      return day === '2026-09-20' ? success() : failure(131002, '未来时长不足');
+    } });
+    const state = createState();
+    state.settings.futureDays = 7;
+    const result = await createVipService(ctx, state, client, {
+      now: () => new Date('2026-09-20T02:00:00Z'),
+      sleep: async () => {},
+    }).claimConfigured();
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain('未来时长不足，已停在 2026-09-21');
+    expect(calls.claim).toEqual(['2026-09-20', '2026-09-21']);
+  });
+
   test('runs ads with an interval after the first report', async () => {
     const { ctx } = createContext();
     const { client, calls } = createClient();
@@ -285,21 +302,31 @@ describe('task service', () => {
     expect(state.persisted.history).toHaveLength(1);
   });
 
-  test('runs claim, ads and upgrade in order', async () => {
+  test('extends membership before claiming future dates', async () => {
     const { ctx } = createContext();
     const order: string[] = [];
     const { client } = createClient({
-      claimDayVip: async () => { order.push('claim'); return success(); },
+      claimDayVip: async (day) => { order.push(`claim:${day}`); return success(); },
       reportAdPlay: async () => { order.push('ad'); return success('成功', { done: 1, remain: 0 }); },
       upgradeDayVip: async () => { order.push('upgrade'); return success(); },
     });
     const state = createState();
+    state.settings.futureDays = 2;
     state.settings.adEnabled = true;
     state.settings.adCount = 1;
     state.settings.autoUpgrade = true;
-    const result = await createVipService(ctx, state, client).runAll();
+    const result = await createVipService(ctx, state, client, {
+      now: () => new Date('2026-09-20T02:00:00Z'),
+      sleep: async () => {},
+    }).runAll();
     expect(result.ok).toBe(true);
-    expect(order).toEqual(['claim', 'ad', 'upgrade']);
+    expect(order).toEqual([
+      'claim:2026-09-20',
+      'upgrade',
+      'ad',
+      'claim:2026-09-21',
+      'claim:2026-09-22',
+    ]);
     expect(state.persisted.history).toHaveLength(1);
   });
 

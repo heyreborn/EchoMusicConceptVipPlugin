@@ -171,6 +171,7 @@ const formatVipText = (payload)=>{
 };
 const isAlreadyClaimedResult = (result)=>131001 === result.code || /已领|已经领|重复领|领过/.test(result.message);
 const isAlreadyUpgradedResult = (result)=>297002 === result.code || /已经领取过升级|已升级|重复升级/.test(result.message);
+const isFutureDurationInsufficient = (result)=>/未来.*时长不足|未来时长不足/.test(result.message);
 const createResult = (patch)=>({
         claimed: false,
         alreadyClaimed: false,
@@ -222,14 +223,13 @@ const createVipService = (ctx, state, client, deps = {})=>{
         state.persisted.lastResult = entry.message;
         await persist();
     };
-    const claimDates = async (options, todayOnly)=>{
+    const claimDates = async (options, scope)=>{
         client.getAuth();
-        const settings = todayOnly ? {
-            ...state.settings,
-            futureDays: 0,
-            receiveDay: 'auto'
-        } : state.settings;
-        const dates = buildTargetDates(settings, now());
+        const today = formatChinaDay(now());
+        const configuredDates = buildTargetDates(state.settings, now());
+        const dates = 'today' === scope ? [
+            today
+        ] : 'future' === scope ? configuredDates.filter((day)=>day !== today) : configuredDates;
         const targets = options.force ? dates : dates.filter((day)=>!state.persisted.claimedDates[day]?.ok);
         if (0 === targets.length) {
             const message = '目标日期均已完成领取';
@@ -244,6 +244,7 @@ const createVipService = (ctx, state, client, deps = {})=>{
         let claimed = 0;
         let already = 0;
         const failures = [];
+        let insufficientDay = '';
         for(let index = 0; index < targets.length; index += 1){
             if (state.cancelRequested) break;
             if (index > 0) await sleep(CLAIM_TASK_INTERVAL_MS);
@@ -267,6 +268,10 @@ const createVipService = (ctx, state, client, deps = {})=>{
                     continue;
                 }
                 failures.push(`${day}: ${result.message}`);
+                if (isFutureDurationInsufficient(result)) {
+                    insufficientDay = day;
+                    break;
+                }
                 if (20018 === result.code) break;
             } catch (error) {
                 failures.push(`${day}: ${error instanceof Error ? error.message : '网络请求失败'}`);
@@ -286,7 +291,8 @@ const createVipService = (ctx, state, client, deps = {})=>{
         const parts = [
             claimed ? `新领取 ${claimed} 天` : '',
             already ? `${already} 天已领取` : '',
-            failures.length ? `失败 ${failures.length} 天：${failures[0]}` : ''
+            insufficientDay ? `未来时长不足，已停在 ${insufficientDay}` : '',
+            failures.length && !insufficientDay ? `失败 ${failures.length} 天：${failures[0]}` : ''
         ].filter(Boolean);
         const message = parts.join('；') || '领取任务已完成';
         setStatus(failures.length ? claimed + already > 0 ? 'partial' : 'error' : already && !claimed ? 'already-claimed' : 'claimed', formatChinaDay(now()), message);
@@ -470,48 +476,58 @@ const createVipService = (ctx, state, client, deps = {})=>{
         });
         return operationInFlight;
     };
-    const claimConfigured = (options = {})=>execute(options.source ?? 'manual', ()=>claimDates(options, false));
-    const claimToday = (options = {})=>execute(options.source ?? 'manual', ()=>claimDates(options, true));
+    const claimConfigured = (options = {})=>execute(options.source ?? 'manual', ()=>claimDates(options, 'configured'));
+    const claimToday = (options = {})=>execute(options.source ?? 'manual', ()=>claimDates(options, 'today'));
     const runAds = (options = {})=>execute(options.source ?? 'manual', ()=>runAdsInternal({
                 ...options,
                 includeAds: true
             }));
     const upgrade = (options = {})=>execute(options.source ?? 'manual', ()=>upgradeInternal(options));
     const runAll = (options = {})=>execute(options.source ?? 'manual', async ()=>{
-            const claim = await claimDates(options, false);
+            const usesAutomaticDates = 'auto' === state.settings.receiveDay.trim().toLowerCase();
+            const initialClaim = await claimDates(options, usesAutomaticDates ? 'today' : 'configured');
             const messages = [
-                claim.message
+                initialClaim.message
             ];
-            let ok = claim.ok;
+            let ok = initialClaim.ok;
+            let claimed = initialClaim.claimed;
+            let alreadyClaimed = initialClaim.alreadyClaimed;
             let upgraded = false;
-            if (!claim.ok && !claim.claimed) return claim;
-            if (!state.cancelRequested && (state.settings.adEnabled || options.includeAds)) {
-                const ads = await runAdsInternal(options);
-                messages.push(ads.message);
-                ok = ok && ads.ok;
-            }
+            if (!initialClaim.ok && !initialClaim.claimed) return initialClaim;
             if (!state.cancelRequested && (state.settings.autoUpgrade || options.includeUpgrade)) {
                 const upgradeResult = await upgradeInternal(options);
                 messages.push(upgradeResult.message);
                 ok = ok && upgradeResult.ok;
                 upgraded = upgradeResult.upgraded;
             }
+            if (!state.cancelRequested && (state.settings.adEnabled || options.includeAds)) {
+                const ads = await runAdsInternal(options);
+                messages.push(ads.message);
+                ok = ok && ads.ok;
+            }
+            if (!state.cancelRequested && usesAutomaticDates && state.settings.futureDays > 0) {
+                const futureClaim = await claimDates(options, 'future');
+                messages.push(futureClaim.message);
+                ok = ok && futureClaim.ok;
+                claimed = claimed || futureClaim.claimed;
+                alreadyClaimed = alreadyClaimed || futureClaim.alreadyClaimed;
+            }
             const message = messages.filter(Boolean).join('；');
             if (state.cancelRequested) return createResult({
                 ok: false,
-                claimed: claim.claimed,
+                claimed,
                 upgraded,
                 canceled: true,
                 message
             });
-            setStatus(ok ? upgraded ? 'upgraded' : claim.claimed ? 'claimed' : 'idle' : claim.claimed ? 'partial' : 'error', formatChinaDay(now()), message);
+            setStatus(ok ? upgraded ? 'upgraded' : claimed ? 'claimed' : 'idle' : claimed ? 'partial' : 'error', formatChinaDay(now()), message);
             refresh({
                 reportFailure: false
             });
             return createResult({
                 ok,
-                claimed: claim.claimed,
-                alreadyClaimed: claim.alreadyClaimed,
+                claimed,
+                alreadyClaimed,
                 upgraded,
                 message
             });
@@ -990,10 +1006,10 @@ const createSettingsComponent = (ctx, state, service, scheduleStartup)=>ctx.vue.
                     h('section', {
                         class: 'echo-vip-options'
                     }, [
-                        switchRow('启动后自动执行', '按照启动延迟执行领取、广告和升级任务', 'autoClaim'),
+                        switchRow('启动后自动执行', '先领取今天，再升级、执行广告并领取未来日期', 'autoClaim'),
                         sliderRow('未来领取天数', '0 表示只领取今天，7 表示今天及未来七天', 'futureDays', 7, ' 天'),
                         sliderRow('启动延迟', '等待 EchoMusic 登录态和设备信息加载', 'delaySeconds', 60, ' 秒'),
-                        switchRow('领取后自动升级', '领取流程完成后提交每日升级任务', 'autoUpgrade'),
+                        switchRow('领取后自动升级', '领取今天后先增加概念会员时长，再尝试未来日期', 'autoUpgrade'),
                         switchRow('模拟广告任务', '实验性功能，通过酷狗网关提交广告完成记录', 'adEnabled'),
                         sliderRow('每日广告次数', '每次间隔约 35 秒，每日最多 8 次', 'adCount', 8, ' 次', !draft.adEnabled),
                         switchRow('自动任务结果通知', '自动执行结束后显示应用内通知', 'notifySuccess'),
