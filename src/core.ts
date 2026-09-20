@@ -24,10 +24,9 @@ export const DEFAULT_SETTINGS: Readonly<PluginSettings> = Object.freeze({
   autoUpgrade: false,
   notifySuccess: true,
   futureDays: 7,
-  delaySeconds: 8,
+  delaySeconds: 60,
   adEnabled: false,
   adCount: 8,
-  receiveDay: 'auto',
 });
 
 export const EMPTY_STATUS: Readonly<ClaimStatus> = Object.freeze({
@@ -57,11 +56,6 @@ const clampInteger = (value: unknown, minimum: number, maximum: number, fallback
 
 export const normalizeSettings = (value: unknown): PluginSettings => {
   const source = asRecord(value);
-  const rawReceiveDay = typeof source?.receiveDay === 'string' ? source.receiveDay.trim() : '';
-  const receiveDay =
-    rawReceiveDay.toLowerCase() === 'auto' || /^\d{4}-\d{2}-\d{2}$/.test(rawReceiveDay)
-      ? rawReceiveDay || DEFAULT_SETTINGS.receiveDay
-      : DEFAULT_SETTINGS.receiveDay;
   return {
     autoClaim: typeof source?.autoClaim === 'boolean' ? source.autoClaim : DEFAULT_SETTINGS.autoClaim,
     autoUpgrade:
@@ -72,7 +66,6 @@ export const normalizeSettings = (value: unknown): PluginSettings => {
     delaySeconds: clampInteger(source?.delaySeconds, 0, 60, DEFAULT_SETTINGS.delaySeconds),
     adEnabled: typeof source?.adEnabled === 'boolean' ? source.adEnabled : DEFAULT_SETTINGS.adEnabled,
     adCount: clampInteger(source?.adCount, 0, 8, DEFAULT_SETTINGS.adCount),
-    receiveDay,
   };
 };
 
@@ -107,8 +100,6 @@ export const addDays = (day: string, amount: number): string => {
 };
 
 export const buildTargetDates = (settings: PluginSettings, now = new Date()): string[] => {
-  const specified = settings.receiveDay.trim();
-  if (specified && specified.toLowerCase() !== 'auto') return [specified];
   const today = formatChinaDay(now);
   return Array.from({ length: settings.futureDays + 1 }, (_, index) => addDays(today, index));
 };
@@ -230,7 +221,11 @@ export const createVipService = (
 ): VipService => {
   const now = deps.now ?? (() => new Date());
   let operationInFlight: Promise<ClaimResult> | null = null;
+  let refreshInFlight: Promise<boolean> | null = null;
+  let operationSettings: PluginSettings | null = null;
   let interruptWait: (() => void) | null = null;
+
+  const getSettings = () => operationSettings ?? state.settings;
 
   const sleep = deps.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => {
     const timer = window.setTimeout(() => {
@@ -267,16 +262,24 @@ export const createVipService = (
 
   const claimDates = async (
     options: RunOptions,
-    scope: 'configured' | 'today' | 'future',
+    scope: 'configured' | 'today' | 'future' | 'specified',
+    specifiedDay = '',
   ): Promise<ClaimResult> => {
     client.getAuth();
     const today = formatChinaDay(now());
-    const configuredDates = buildTargetDates(state.settings, now());
+    const configuredDates = buildTargetDates(getSettings(), now());
     const dates = scope === 'today'
       ? [today]
       : scope === 'future'
         ? configuredDates.filter((day) => day !== today)
+        : scope === 'specified'
+          ? [specifiedDay]
         : configuredDates;
+    if (dates.length === 0) {
+      const message = '未配置未来预领日期';
+      setStatus('idle', today, message);
+      return createResult({ ok: true, message });
+    }
     const targets = options.force
       ? dates
       : dates.filter((day) => !state.persisted.claimedDates[day]?.ok);
@@ -312,11 +315,11 @@ export const createVipService = (
           await persist();
           continue;
         }
-        failures.push(`${day}: ${result.message}`);
         if (isFutureDurationInsufficient(result)) {
           insufficientDay = day;
           break;
         }
+        failures.push(`${day}: ${result.message}`);
         if (result.code === 20018) break;
       } catch (error) {
         failures.push(`${day}: ${error instanceof Error ? error.message : '网络请求失败'}`);
@@ -332,19 +335,27 @@ export const createVipService = (
     const parts = [
       claimed ? `新领取 ${claimed} 天` : '',
       already ? `${already} 天已领取` : '',
-      insufficientDay ? `未来时长不足，已停在 ${insufficientDay}` : '',
+      insufficientDay ? `已达当前可预领上限，停在 ${insufficientDay}` : '',
       failures.length && !insufficientDay ? `失败 ${failures.length} 天：${failures[0]}` : '',
     ].filter(Boolean);
     const message = parts.join('；') || '领取任务已完成';
+    const limited = Boolean(insufficientDay);
     setStatus(
-      failures.length ? (claimed + already > 0 ? 'partial' : 'error') : already && !claimed ? 'already-claimed' : 'claimed',
-      formatChinaDay(now()),
+      limited
+        ? 'limit'
+        : failures.length
+          ? (claimed + already > 0 ? 'partial' : 'error')
+          : already && !claimed
+            ? 'already-claimed'
+            : 'claimed',
+      today,
       message,
     );
     return createResult({
       ok: failures.length === 0,
       claimed: claimed + already > 0,
       alreadyClaimed: already > 0,
+      limited,
       message,
     });
   };
@@ -352,8 +363,9 @@ export const createVipService = (
   const runAdsInternal = async (options: RunOptions): Promise<ClaimResult> => {
     client.getAuth();
     const day = formatChinaDay(now());
-    const target = state.settings.adEnabled || options.includeAds
-      ? state.settings.adCount
+    const settings = getSettings();
+    const target = settings.adEnabled || options.includeAds
+      ? settings.adCount
       : 0;
     if (target <= 0) return createResult({ ok: true, message: '广告任务未启用' });
     const previous = state.persisted.adTaskDates[day];
@@ -423,48 +435,71 @@ export const createVipService = (
     }
   };
 
-  const refresh = async (options: RefreshOptions = {}): Promise<boolean> => {
-    const day = formatChinaDay(now());
-    setProgress('refresh', 0, 1, '正在刷新状态');
-    const [record, vip] = await Promise.allSettled([
-      client.getMonthVipRecord(),
-      client.getUnionVip(),
-    ]);
-    if (vip.status === 'fulfilled' && vip.value.ok) {
-      state.vipDetail = vip.value.raw;
-      state.vipText = formatVipText(vip.value.raw);
-    } else {
-      const message = vip.status === 'fulfilled' ? vip.value.message : vip.reason instanceof Error ? vip.reason.message : '查询失败';
-      state.vipText = `会员状态查询失败：${message}`;
-    }
-    if (record.status === 'fulfilled' && record.value.ok) {
-      state.monthRecord = record.value.raw;
-      if (hasClaimedDay(record.value.raw, day)) {
-        state.persisted.claimedDates[day] = { ok: true, already: true, message: `${day} 已领取`, updatedAt: Date.now() };
-        await persist();
-        setStatus('already-claimed', day, `${day} 已领取`);
-      } else if (!state.persisted.claimedDates[day]?.ok) {
-        setStatus('idle', day, '领取记录已刷新');
+  const refresh = (options: RefreshOptions = {}): Promise<boolean> => {
+    if (refreshInFlight) return refreshInFlight;
+    state.refreshing = true;
+    state.refreshMessage = '正在刷新状态';
+    refreshInFlight = (async () => {
+      const [record, vip] = await Promise.allSettled([
+        client.getMonthVipRecord(),
+        client.getUnionVip(),
+      ]);
+      const recordOk = record.status === 'fulfilled' && record.value.ok;
+      const vipOk = vip.status === 'fulfilled' && vip.value.ok;
+      if (vipOk) {
+        state.vipDetail = vip.value.raw;
+        state.vipText = formatVipText(vip.value.raw);
+      } else {
+        const message = vip.status === 'fulfilled'
+          ? vip.value.message
+          : vip.reason instanceof Error
+            ? vip.reason.message
+            : '查询失败';
+        state.vipText = `会员状态查询失败：${message}`;
       }
-      setProgress('idle', 0, 0, '');
-      return true;
-    }
-    if (options.reportFailure !== false) {
-      const message = record.status === 'fulfilled'
+      if (recordOk) {
+        state.monthRecord = record.value.raw;
+        let changed = false;
+        for (const targetDay of buildTargetDates(state.settings, now())) {
+          if (!hasClaimedDay(record.value.raw, targetDay)) continue;
+          state.persisted.claimedDates[targetDay] = {
+            ok: true,
+            already: true,
+            message: `${targetDay} 已领取`,
+            updatedAt: Date.now(),
+          };
+          changed = true;
+        }
+        if (changed) await persist();
+      }
+      const recordError = record.status === 'fulfilled'
         ? record.value.message
         : record.reason instanceof Error
           ? record.reason.message
           : '领取记录查询失败';
-      setStatus('error', day, `领取记录刷新失败：${message}`);
-    }
-    setProgress('idle', 0, 0, '');
-    return false;
+      const vipError = vip.status === 'fulfilled'
+        ? vip.value.message
+        : vip.reason instanceof Error
+          ? vip.reason.message
+          : '会员状态查询失败';
+      state.refreshedAt = Date.now();
+      if (recordOk && vipOk) state.refreshMessage = '状态已更新';
+      else if (recordOk) state.refreshMessage = `领取状态已更新；会员查询失败：${vipError}`;
+      else if (vipOk) state.refreshMessage = `会员状态已更新；领取记录查询失败：${recordError}`;
+      else state.refreshMessage = options.reportFailure === false ? '后台刷新失败' : `刷新失败：${recordError}`;
+      return recordOk;
+    })().finally(() => {
+      state.refreshing = false;
+      refreshInFlight = null;
+    });
+    return refreshInFlight;
   };
 
   const execute = (source: 'manual' | 'auto', operation: () => Promise<ClaimResult>) => {
     if (operationInFlight) return operationInFlight;
     state.running = true;
     state.cancelRequested = false;
+    operationSettings = normalizeSettings({ ...state.settings });
     const startedAt = Date.now();
     operationInFlight = (async () => {
       let result: ClaimResult;
@@ -475,7 +510,16 @@ export const createVipService = (
         setStatus('error', formatChinaDay(now()), message);
         result = createResult({ ok: false, message });
       }
-      await addHistory({ source, startedAt, finishedAt: Date.now(), ok: result.ok, message: result.message });
+      const outcome: HistoryEntry['outcome'] = result.canceled
+        ? 'canceled'
+        : result.limited
+          ? 'limit'
+          : result.ok
+            ? 'success'
+            : result.claimed || result.upgraded
+              ? 'partial'
+              : 'failed';
+      await addHistory({ source, startedAt, finishedAt: Date.now(), ok: result.ok, outcome, message: result.message });
       if (source === 'auto' && state.settings.notifySuccess) {
         ctx.toast[result.ok ? 'success' : 'warning'](result.message);
       }
@@ -484,6 +528,7 @@ export const createVipService = (
         state.running = false;
         state.cancelRequested = false;
         setProgress('idle', 0, 0, '');
+        operationSettings = null;
         operationInFlight = null;
       });
     return operationInFlight;
@@ -493,49 +538,64 @@ export const createVipService = (
     execute(options.source ?? 'manual', () => claimDates(options, 'configured'));
   const claimToday = (options: RunOptions = {}) =>
     execute(options.source ?? 'manual', () => claimDates(options, 'today'));
+  const claimFuture = (options: RunOptions = {}) =>
+    execute(options.source ?? 'manual', () => claimDates(options, 'future'));
+  const claimDate = (day: string, options: RunOptions = {}) =>
+    execute(options.source ?? 'manual', async () => {
+      const normalizedDay = day.trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(normalizedDay) || addDays(normalizedDay, 0) !== normalizedDay) {
+        throw new Error('请选择有效的领取日期');
+      }
+      if (normalizedDay < formatChinaDay(now())) throw new Error('不能领取早于今天的日期');
+      return claimDates(options, 'specified', normalizedDay);
+    });
   const runAds = (options: RunOptions = {}) =>
     execute(options.source ?? 'manual', () => runAdsInternal({ ...options, includeAds: true }));
   const upgrade = (options: RunOptions = {}) =>
     execute(options.source ?? 'manual', () => upgradeInternal(options));
   const runAll = (options: RunOptions = {}) =>
     execute(options.source ?? 'manual', async () => {
-      const usesAutomaticDates = state.settings.receiveDay.trim().toLowerCase() === 'auto';
-      const initialClaim = await claimDates(options, usesAutomaticDates ? 'today' : 'configured');
+      const settings = getSettings();
+      const initialClaim = await claimDates(options, 'today');
       const messages = [initialClaim.message];
       let ok = initialClaim.ok;
       let claimed = initialClaim.claimed;
       let alreadyClaimed = initialClaim.alreadyClaimed;
       let upgraded = false;
       if (!initialClaim.ok && !initialClaim.claimed) return initialClaim;
-      if (!state.cancelRequested && (state.settings.autoUpgrade || options.includeUpgrade)) {
+      let limited = initialClaim.limited;
+      if (!state.cancelRequested && (settings.autoUpgrade || options.includeUpgrade)) {
         const upgradeResult = await upgradeInternal(options);
         messages.push(upgradeResult.message);
         ok = ok && upgradeResult.ok;
         upgraded = upgradeResult.upgraded;
       }
-      if (!state.cancelRequested && (state.settings.adEnabled || options.includeAds)) {
+      if (!state.cancelRequested && (settings.adEnabled || options.includeAds)) {
         const ads = await runAdsInternal(options);
         messages.push(ads.message);
         ok = ok && ads.ok;
       }
-      if (!state.cancelRequested && usesAutomaticDates && state.settings.futureDays > 0) {
+      if (!state.cancelRequested && settings.futureDays > 0) {
         const futureClaim = await claimDates(options, 'future');
         messages.push(futureClaim.message);
         ok = ok && futureClaim.ok;
         claimed = claimed || futureClaim.claimed;
         alreadyClaimed = alreadyClaimed || futureClaim.alreadyClaimed;
+        limited = limited || futureClaim.limited;
       }
       const message = messages.filter(Boolean).join('；');
       if (state.cancelRequested) return createResult({ ok: false, claimed, upgraded, canceled: true, message });
-      setStatus(ok ? (upgraded ? 'upgraded' : claimed ? 'claimed' : 'idle') : claimed ? 'partial' : 'error', formatChinaDay(now()), message);
+      setStatus(limited ? 'limit' : ok ? (upgraded ? 'upgraded' : claimed ? 'claimed' : 'idle') : claimed ? 'partial' : 'error', formatChinaDay(now()), message);
       void refresh({ reportFailure: false });
-      return createResult({ ok, claimed, alreadyClaimed, upgraded, message });
+      return createResult({ ok, claimed, alreadyClaimed, upgraded, limited, message });
     });
 
   return {
     runAll,
     claimConfigured,
     claimToday,
+    claimFuture,
+    claimDate,
     upgrade,
     runAds,
     refresh,

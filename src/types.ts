@@ -6,7 +6,6 @@ export interface PluginSettings {
   delaySeconds: number;
   adEnabled: boolean;
   adCount: number;
-  receiveDay: string;
 }
 
 export type ClaimStatusKind =
@@ -18,6 +17,7 @@ export type ClaimStatusKind =
   | 'claimed'
   | 'already-claimed'
   | 'upgraded'
+  | 'limit'
   | 'partial'
   | 'canceled'
   | 'error';
@@ -42,6 +42,7 @@ export interface HistoryEntry {
   startedAt: number;
   finishedAt: number;
   ok: boolean;
+  outcome?: 'success' | 'limit' | 'partial' | 'canceled' | 'failed';
   message: string;
 }
 
@@ -68,6 +69,9 @@ export interface PluginState {
   vipDetail: unknown;
   vipText: string;
   running: boolean;
+  refreshing: boolean;
+  refreshMessage: string;
+  refreshedAt: number;
   cancelRequested: boolean;
   progress: TaskProgress;
 }
@@ -77,6 +81,7 @@ export interface ClaimResult {
   claimed: boolean;
   alreadyClaimed: boolean;
   upgraded: boolean;
+  limited?: boolean;
   canceled?: boolean;
   message: string;
 }
@@ -178,6 +183,8 @@ export interface VipService {
   runAll(options?: RunOptions): Promise<ClaimResult>;
   claimConfigured(options?: RunOptions): Promise<ClaimResult>;
   claimToday(options?: RunOptions): Promise<ClaimResult>;
+  claimFuture(options?: RunOptions): Promise<ClaimResult>;
+  claimDate(day: string, options?: RunOptions): Promise<ClaimResult>;
   upgrade(options?: RunOptions): Promise<ClaimResult>;
   runAds(options?: RunOptions): Promise<ClaimResult>;
   refresh(options?: RefreshOptions): Promise<boolean>;

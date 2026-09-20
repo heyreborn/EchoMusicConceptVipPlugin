@@ -57,6 +57,9 @@ const createState = (): PluginState => ({
   vipDetail: null,
   vipText: '',
   running: false,
+  refreshing: false,
+  refreshMessage: '尚未刷新状态',
+  refreshedAt: 0,
   cancelRequested: false,
   progress: { phase: 'idle', current: 0, total: 0, label: '' },
 });
@@ -191,6 +194,7 @@ describe('date and response utilities', () => {
       adEnabled: false,
       adCount: 8,
     });
+    expect(normalizeSettings({}).delaySeconds).toBe(60);
   });
 
   test('finds claimed days and formats membership status', () => {
@@ -251,8 +255,9 @@ describe('task service', () => {
       now: () => new Date('2026-09-20T02:00:00Z'),
       sleep: async () => {},
     }).claimConfigured();
-    expect(result.ok).toBe(false);
-    expect(result.message).toContain('未来时长不足，已停在 2026-09-21');
+    expect(result).toMatchObject({ ok: true, limited: true });
+    expect(result.message).toContain('已达当前可预领上限，停在 2026-09-21');
+    expect(state.status.kind).toBe('limit');
     expect(calls.claim).toEqual(['2026-09-20', '2026-09-21']);
   });
 
@@ -330,6 +335,25 @@ describe('task service', () => {
     expect(state.persisted.history).toHaveLength(1);
   });
 
+  test('uses a settings snapshot for an active task', async () => {
+    const { ctx } = createContext();
+    const state = createState();
+    state.settings.futureDays = 2;
+    state.settings.autoUpgrade = true;
+    const { client, calls } = createClient({
+      upgradeDayVip: async () => {
+        state.settings.futureDays = 0;
+        return success('升级成功');
+      },
+    });
+    const result = await createVipService(ctx, state, client, {
+      now: () => new Date('2026-09-20T02:00:00Z'),
+      sleep: async () => {},
+    }).runAll();
+    expect(result.ok).toBe(true);
+    expect(calls.claim).toEqual(['2026-09-20', '2026-09-21', '2026-09-22']);
+  });
+
   test('does not let membership query failure override a successful record refresh', async () => {
     const today = formatChinaDay();
     const { ctx } = createContext();
@@ -340,8 +364,52 @@ describe('task service', () => {
     const state = createState();
     const result = await createVipService(ctx, state, client).refresh();
     expect(result).toBe(true);
-    expect(state.status.kind).toBe('already-claimed');
+    expect(state.persisted.claimedDates[today]?.ok).toBe(true);
+    expect(state.refreshing).toBe(false);
+    expect(state.refreshMessage).toContain('领取状态已更新');
+    expect(state.refreshedAt).toBeGreaterThan(0);
     expect(state.vipText).toContain('查询失败');
+  });
+
+  test('deduplicates concurrent refresh requests', async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const { ctx } = createContext();
+    const { client, calls } = createClient({
+      getMonthVipRecord: async () => {
+        calls.record += 1;
+        await gate;
+        return success('成功', []);
+      },
+    });
+    const state = createState();
+    const service = createVipService(ctx, state, client);
+    const first = service.refresh();
+    const second = service.refresh();
+    expect(state.refreshing).toBe(true);
+    release?.();
+    expect(await first).toBe(true);
+    expect(await second).toBe(true);
+    expect(calls.record).toBe(1);
+    expect(state.refreshing).toBe(false);
+  });
+
+  test('validates one-off specified dates', async () => {
+    const { ctx } = createContext();
+    const { client, calls } = createClient();
+    const state = createState();
+    const service = createVipService(ctx, state, client, {
+      now: () => new Date('2026-09-20T02:00:00Z'),
+    });
+    const invalid = await service.claimDate('2026-09-19');
+    expect(invalid.ok).toBe(false);
+    expect(invalid.message).toContain('不能领取早于今天');
+    const impossible = await service.claimDate('2026-02-31');
+    expect(impossible.ok).toBe(false);
+    expect(impossible.message).toContain('请选择有效的领取日期');
+    const valid = await service.claimDate('2026-09-23');
+    expect(valid.ok).toBe(true);
+    expect(calls.claim).toEqual(['2026-09-23']);
   });
 
   test('deduplicates concurrent operations', async () => {
