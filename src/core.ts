@@ -179,17 +179,6 @@ const findMessage = (value: unknown, depth = 0): string => {
   return '';
 };
 
-export const getErrorMessage = (error: unknown, fallback = '操作失败'): string => {
-  const record = asRecord(error);
-  const response = asRecord(record?.response);
-  return (
-    findMessage(response?.body) ||
-    findMessage(record) ||
-    (error instanceof Error ? error.message : '') ||
-    fallback
-  );
-};
-
 const getApiErrorCode = (payload: Record<string, unknown>): string => {
   for (const key of ['error_code', 'err_code', 'errcode']) {
     const value = payload[key];
@@ -198,6 +187,20 @@ const getApiErrorCode = (payload: Record<string, unknown>): string => {
     }
   }
   return '';
+};
+
+export const getErrorMessage = (error: unknown, fallback = '操作失败'): string => {
+  const record = asRecord(error);
+  const response = asRecord(record?.response);
+  const responseBody = asRecord(response?.body);
+  const responseErrorCode = responseBody ? getApiErrorCode(responseBody) : '';
+  return (
+    findMessage(response?.body) ||
+    (responseErrorCode ? `酷狗接口错误 (${responseErrorCode})` : '') ||
+    findMessage(record) ||
+    (error instanceof Error ? error.message : '') ||
+    fallback
+  );
 };
 
 export const assertApiSuccess = (payload: unknown, fallback: string): unknown => {

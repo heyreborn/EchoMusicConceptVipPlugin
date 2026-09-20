@@ -118,11 +118,6 @@ const findMessage = (value, depth = 0)=>{
     }
     return '';
 };
-const getErrorMessage = (error, fallback = '操作失败')=>{
-    const record = asRecord(error);
-    const response = asRecord(record?.response);
-    return findMessage(response?.body) || findMessage(record) || (error instanceof Error ? error.message : '') || fallback;
-};
 const getApiErrorCode = (payload)=>{
     for (const key of [
         'error_code',
@@ -133,6 +128,13 @@ const getApiErrorCode = (payload)=>{
         if (null != value && '0' !== String(value)) return `${key}: ${String(value)}`;
     }
     return '';
+};
+const getErrorMessage = (error, fallback = '操作失败')=>{
+    const record = asRecord(error);
+    const response = asRecord(record?.response);
+    const responseBody = asRecord(response?.body);
+    const responseErrorCode = responseBody ? getApiErrorCode(responseBody) : '';
+    return findMessage(response?.body) || (responseErrorCode ? `酷狗接口错误 (${responseErrorCode})` : '') || findMessage(record) || (error instanceof Error ? error.message : '') || fallback;
 };
 const assertApiSuccess = (payload, fallback)=>{
     const record = asRecord(payload);

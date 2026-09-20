@@ -115,6 +115,16 @@ describe('core utilities', () => {
     expect(isAlreadyClaimedError(error)).toBe(true);
   });
 
+  test('shows the KuGou error code when a 502 response has no message', () => {
+    const error = Object.assign(new Error('API Error: 502'), {
+      response: {
+        status: 502,
+        body: { status: 0, error_code: 20028, error_msg: '' },
+      },
+    });
+    expect(getErrorMessage(error)).toBe('酷狗接口错误 (error_code: 20028)');
+  });
+
   test('rejects resolved KuGou business failures', () => {
     expect(() =>
       assertApiSuccess(
