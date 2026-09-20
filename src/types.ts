@@ -90,8 +90,12 @@ export interface ClaimOptions {
   source?: 'manual' | 'auto';
 }
 
+export interface RefreshOptions {
+  reportFailure?: boolean;
+}
+
 export interface VipService {
   claimToday(options?: ClaimOptions): Promise<ClaimResult>;
   upgrade(): Promise<ClaimResult>;
-  refresh(): Promise<boolean>;
+  refresh(options?: RefreshOptions): Promise<boolean>;
 }

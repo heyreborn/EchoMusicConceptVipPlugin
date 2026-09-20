@@ -249,6 +249,43 @@ describe('VIP service', () => {
     expect(state.vipDetail).toBeNull();
     expect(state.monthRecord).not.toBeNull();
     expect(state.refreshing).toBe(false);
+    expect(state.status).toMatchObject({ kind: 'error' });
+    expect(state.status.message).toContain('登录已过期');
+  });
+
+  test('refresh exposes an error code when a query returns a message-less 502', async () => {
+    const { ctx } = createContext({
+      async getVipMonthRecord() {
+        throw Object.assign(new Error('API Error: 502'), {
+          response: {
+            status: 502,
+            body: { status: 0, error_code: 20028, error_msg: '' },
+          },
+        });
+      },
+    });
+    const state = createState();
+    const result = await createVipService(ctx, state).refresh();
+    expect(result).toBe(false);
+    expect(state.status.message).toContain('error_code: 20028');
+  });
+
+  test('background refresh failure does not overwrite a successful operation status', async () => {
+    const { ctx } = createContext({
+      async getUserVipDetail() {
+        throw new Error('network unavailable');
+      },
+    });
+    const state = createState();
+    state.status = {
+      kind: 'claimed',
+      day: formatChinaDay(),
+      message: '领取成功',
+      updatedAt: Date.now(),
+    };
+    const result = await createVipService(ctx, state).refresh({ reportFailure: false });
+    expect(result).toBe(false);
+    expect(state.status.kind).toBe('claimed');
   });
 
   test('refresh derives today claimed status from the month record', async () => {

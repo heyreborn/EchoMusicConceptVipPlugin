@@ -173,7 +173,7 @@ const createVipService = (ctx, state)=>{
             message,
             updatedAt: Date.now()
         });
-    const refresh = async ()=>{
+    const refresh = async (options = {})=>{
         state.refreshing = true;
         const [vipResult, recordResult] = await Promise.allSettled([
             ctx.kugou.user.getUserVipDetail().then((result)=>assertApiSuccess(result, '会员信息刷新失败')),
@@ -183,6 +183,14 @@ const createVipService = (ctx, state)=>{
         if ('fulfilled' === vipResult.status) state.vipDetail = vipResult.value;
         if ('fulfilled' === recordResult.status) state.monthRecord = recordResult.value;
         const day = formatChinaDay();
+        const failures = [
+            'rejected' === vipResult.status ? `会员信息：${getErrorMessage(vipResult.reason, '查询失败')}` : '',
+            'rejected' === recordResult.status ? `领取记录：${getErrorMessage(recordResult.reason, '查询失败')}` : ''
+        ].filter(Boolean);
+        if (failures.length > 0) {
+            if (false !== options.reportFailure) await updateStatus('error', day, `状态刷新失败：${failures.join('；')}`);
+            return false;
+        }
         if ('fulfilled' === recordResult.status && hasClaimedDay(recordResult.value, day)) await updateStatus('already-claimed', day, `${day} 已领取`);
         else if ('fulfilled' === vipResult.status && 'fulfilled' === recordResult.status) {
             const currentIsToday = state.status.day === day && 'idle' !== state.status.kind;
@@ -246,7 +254,9 @@ const createVipService = (ctx, state)=>{
             const message = getApiMessage(response, '已升级为畅听会员');
             await updateStatus('upgraded', day, message);
             if ('manual' === source || state.settings.notifySuccess) ctx.toast.success(message);
-            refresh();
+            refresh({
+                reportFailure: false
+            });
             return createResult({
                 ok: true,
                 claimed: true,
@@ -324,7 +334,9 @@ const createVipService = (ctx, state)=>{
         const message = getApiMessage(claimResponse, '今日概念版 VIP 领取成功');
         await updateStatus('claimed', day, message);
         if ('manual' === source || state.settings.notifySuccess) ctx.toast.success(message);
-        refresh();
+        refresh({
+            reportFailure: false
+        });
         return createResult({
             ok: true,
             claimed: true,
@@ -425,7 +437,7 @@ const createSettingsComponent = (ctx, state, service)=>ctx.vue.defineComponent({
                 action.value = 'refresh';
                 try {
                     const ok = await service.refresh();
-                    ctx.toast[ok ? 'success' : 'warning'](ok ? '会员状态已刷新' : '状态刷新失败');
+                    ctx.toast[ok ? 'success' : 'warning'](ok ? '会员状态已刷新' : state.status.message || '状态刷新失败');
                 } finally{
                     action.value = '';
                 }

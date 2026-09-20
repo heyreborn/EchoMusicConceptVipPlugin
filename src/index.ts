@@ -114,7 +114,9 @@ const createSettingsComponent = (
         action.value = 'refresh';
         try {
           const ok = await service.refresh();
-          ctx.toast[ok ? 'success' : 'warning'](ok ? '会员状态已刷新' : '状态刷新失败');
+          ctx.toast[ok ? 'success' : 'warning'](
+            ok ? '会员状态已刷新' : state.status.message || '状态刷新失败',
+          );
         } finally {
           action.value = '';
         }
